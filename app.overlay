@@ -1,0 +1,79 @@
+/*
+ * Copyright (c) 2023 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/ {
+	hid_dev_0: hid_dev_0 {
+		compatible = "zephyr,hid-device";
+		label = "HID0";
+		protocol-code = "none";
+		in-polling-period-us = <1000>;
+		in-report-size = <64>;
+	};
+
+	hid_dev_1: hid_dev_1 {
+		compatible = "zephyr,hid-device";
+		label = "HID1";
+		protocol-code = "none";
+		in-polling-period-us = <1000>;
+		in-report-size = <64>;
+	};
+
+	/* hid_dev_2: WebHID 配置接口
+	 * 用于通过浏览器 WebHID API 读取/保存设备配置参数。
+	 * 使用 Vendor-Defined HID Report Descriptor，
+	 * 通过 Feature 报告实现双向数据交换。
+	 */
+	hid_dev_2: hid_dev_2 {
+		compatible = "zephyr,hid-device";
+		label = "HID2";
+		protocol-code = "none";
+		in-polling-period-us = <1000>;
+		in-report-size = <64>;
+	};
+};
+
+/* ============================================================
+ * Flash 分区覆盖
+ *
+ * nrf52840_partition.dtsi 定义了 MCUboot 分区布局:
+ *   boot (0x0-0xc000) -> slot0 (0xc000-0x82000) -> slot1 ...
+ *
+ * 本板使用 Nordic DFU bootloader，实际 ROM 布局:
+ *   0x00000000 - 0x00000FFF: MBR (4KB)
+ *   0x00001000 - 0x00022FFF: SoftDevice (~136KB, 保留区域)
+ *   0x00023000 - 0x000A2FFF: 应用程序代码 (512KB = CONFIG_FLASH_LOAD_SIZE)
+ *   0x000A3000 - 0x000D7FFF: 保留/未使用
+ *   0x000D8000 - 0x000DFFFF: 存储 (NVS/设置, 32KB)
+ *   0x000E0000 - 0x000FFFFF: Nordic DFU Bootloader (~128KB, 已预烧)
+ *
+ * 注意: 不删除 slot0_partition，只修改其 reg 地址。
+ *       base DTS 中 zephyr,code-partition = &slot0_partition 仍然有效，
+ *       避免 phandle 引用悬空导致 dt_chosen_reg_addr_hex() 返回 0。
+ * ============================================================
+ */
+/delete-node/ &boot_partition;
+/delete-node/ &slot1_partition;
+
+/* slot0_partition: 从 0xC000 -> 0x23000, 大小 0x76000 -> 0x80000 (512KB) */
+&slot0_partition {
+	reg = <0x00023000 0x00080000>;
+};
+
+/* storage_partition: 从 0xF8000 -> 0xD8000 (避开 bootloader 区域) */
+&storage_partition {
+	reg = <0x000d8000 0x00008000>;
+};
+
+/* ============================================================
+ * CDC ACM 虚拟 COM 端口节点
+ * 在 USB 设备控制器下创建一个 CDC ACM UART 实例，
+ * 用于通过 USB 模拟串口输出调试日志。
+ * ============================================================ */
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

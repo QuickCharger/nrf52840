@@ -1,0 +1,939 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>nRF52840 ProMicro WebHID 配置</title>
+	<style>
+		:root {
+			--bg: #1a1a2e;
+			--surface: #16213e;
+			--surface2: #0f3460;
+			--accent: #e94560;
+			--text: #eee;
+			--text-dim: #aaa;
+			--green: #2ecc71;
+			--yellow: #f1c40f;
+			--red: #e74c3c;
+		}
+
+		* {
+			margin: 0;
+			padding: 0;
+			box-sizing: border-box;
+		}
+
+		body {
+			font-family: 'Segoe UI', system-ui, sans-serif;
+			background: var(--bg);
+			color: var(--text);
+			max-width: 800px;
+			margin: 0 auto;
+			padding: 20px;
+		}
+
+		h1 {
+			text-align: center;
+			margin-bottom: 24px;
+			font-weight: 300;
+			font-size: 1.6em;
+		}
+
+		h1 small {
+			display: block;
+			font-size: 0.5em;
+			color: var(--text-dim);
+			margin-top: 4px;
+		}
+
+		/* 连接栏 */
+		.connect-bar {
+			display: flex;
+			gap: 10px;
+			align-items: center;
+			margin-bottom: 20px;
+			flex-wrap: wrap;
+		}
+
+		.connect-bar button {
+			padding: 10px 20px;
+			border: none;
+			border-radius: 6px;
+			font-size: 14px;
+			cursor: pointer;
+			transition: all 0.2s;
+		}
+
+		.btn-connect {
+			background: var(--green);
+			color: #fff;
+		}
+
+		.btn-connect:hover {
+			background: #27ae60;
+		}
+
+		.btn-disconnect {
+			background: var(--red);
+			color: #fff;
+		}
+
+		.btn-disconnect:hover {
+			background: #c0392b;
+		}
+
+		.btn-disconnect:disabled {
+			background: #555;
+			cursor: not-allowed;
+		}
+
+		.status-dot {
+			display: inline-block;
+			width: 12px;
+			height: 12px;
+			border-radius: 50%;
+			margin-right: 8px;
+		}
+
+		.status-dot.disconnected {
+			background: var(--red);
+		}
+
+		.status-dot.connected {
+			background: var(--green);
+		}
+
+		.device-info {
+			font-size: 13px;
+			color: var(--text-dim);
+			margin-left: auto;
+		}
+
+		/* 面板 */
+		.panel {
+			background: var(--surface);
+			border-radius: 10px;
+			padding: 16px;
+			margin-bottom: 16px;
+		}
+
+		.panel h2 {
+			font-size: 1.1em;
+			font-weight: 500;
+			margin-bottom: 12px;
+			color: var(--accent);
+		}
+
+		.panel.disabled {
+			opacity: 0.4;
+			pointer-events: none;
+		}
+
+		/* 参数表格 */
+		.param-table {
+			width: 100%;
+			border-collapse: collapse;
+		}
+
+		.param-table th,
+		.param-table td {
+			padding: 10px 8px;
+			border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+			text-align: left;
+		}
+
+		.param-table th {
+			color: var(--text-dim);
+			font-weight: 400;
+			font-size: 12px;
+			text-transform: uppercase;
+			letter-spacing: 0.5px;
+		}
+
+		.param-table td {
+			font-size: 14px;
+		}
+
+		.param-table input[type="text"],
+		.param-table input[type="number"] {
+			background: var(--surface2);
+			border: 1px solid rgba(255, 255, 255, 0.1);
+			border-radius: 4px;
+			color: var(--text);
+			padding: 6px 10px;
+			width: 120px;
+			font-size: 14px;
+		}
+
+		.param-table input:focus {
+			outline: none;
+			border-color: var(--accent);
+		}
+
+		.param-table input[type="number"] {
+			width: 80px;
+		}
+
+		.param-table .param-name {
+			font-family: 'Courier New', monospace;
+			font-size: 13px;
+			color: var(--text-dim);
+			width: 140px;
+		}
+
+		.param-table .param-id {
+			color: var(--text-dim);
+			font-size: 12px;
+			width: 40px;
+			text-align: center;
+		}
+
+		/* 按钮 */
+		.btn-row {
+			display: flex;
+			gap: 10px;
+			flex-wrap: wrap;
+			margin-top: 12px;
+		}
+
+		.btn-row button {
+			padding: 8px 18px;
+			border: none;
+			border-radius: 6px;
+			font-size: 13px;
+			cursor: pointer;
+			transition: all 0.2s;
+		}
+
+		.btn-row button:disabled {
+			opacity: 0.5;
+			cursor: not-allowed;
+		}
+
+		.btn-primary {
+			background: var(--accent);
+			color: #fff;
+		}
+
+		.btn-primary:hover:not(:disabled) {
+			background: #d63851;
+		}
+
+		.btn-secondary {
+			background: var(--surface2);
+			color: var(--text);
+			border: 1px solid rgba(255, 255, 255, 0.15) !important;
+		}
+
+		.btn-secondary:hover:not(:disabled) {
+			background: #1a4a7a;
+		}
+
+		.btn-danger {
+			background: #e67e22;
+			color: #fff;
+		}
+
+		.btn-danger:hover:not(:disabled) {
+			background: #d35400;
+		}
+
+		.btn-small {
+			padding: 4px 10px;
+			font-size: 12px;
+			border: none;
+			border-radius: 4px;
+			cursor: pointer;
+			background: var(--accent);
+			color: #fff;
+			transition: all 0.2s;
+			white-space: nowrap;
+		}
+
+		.btn-small:hover:not(:disabled) {
+			background: #d63851;
+		}
+
+		.btn-small:disabled {
+			opacity: 0.4;
+			cursor: not-allowed;
+		}
+
+		/* 日志 */
+		.log-box {
+			background: #111;
+			border-radius: 6px;
+			padding: 10px;
+			max-height: 160px;
+			overflow-y: auto;
+			font-family: 'Courier New', monospace;
+			font-size: 12px;
+			line-height: 1.5;
+		}
+
+		.log-box div {
+			padding: 1px 0;
+		}
+
+		.log-info {
+			color: #5dade2;
+		}
+
+		.log-ok {
+			color: var(--green);
+		}
+
+		.log-err {
+			color: var(--red);
+		}
+
+		.log-warn {
+			color: var(--yellow);
+		}
+
+		.log-dim {
+			color: #666;
+		}
+
+		.toast {
+			position: fixed;
+			bottom: 20px;
+			right: 20px;
+			background: var(--surface2);
+			border: 1px solid rgba(255, 255, 255, 0.1);
+			border-radius: 8px;
+			padding: 12px 18px;
+			font-size: 13px;
+			opacity: 0;
+			transform: translateY(20px);
+			transition: all 0.3s;
+			pointer-events: none;
+			z-index: 100;
+		}
+
+		.toast.show {
+			opacity: 1;
+			transform: translateY(0);
+		}
+
+		@media (max-width: 600px) {
+			body {
+				padding: 12px;
+			}
+
+			.connect-bar {
+				flex-direction: column;
+				align-items: stretch;
+			}
+
+			.device-info {
+				margin-left: 0;
+				text-align: center;
+			}
+
+			.param-table input {
+				width: 100% !important;
+			}
+		}
+	</style>
+</head>
+
+<body>
+
+	<h1>
+		nRF52840 ProMicro WebHID 配置
+		<small>连接设备后自动发现参数</small>
+	</h1>
+
+	<!-- 连接栏 -->
+	<div class="connect-bar">
+		<button class="btn-connect" id="btnConnect" onclick="connectDevice()">🔗 连接设备</button>
+		<button class="btn-disconnect" id="btnDisconnect" onclick="disconnectDevice()" disabled>断开</button>
+		<span id="statusText">
+			<span class="status-dot disconnected"></span>未连接
+		</span>
+		<span class="device-info" id="deviceInfo"></span>
+	</div>
+
+	<!-- 参数面板 -->
+	<div class="panel disabled" id="configPanel">
+		<h2>⚙️ 设备参数 <small id="paramCount" style="font-weight:400;font-size:12px;color:var(--text-dim)"></small></h2>
+		<table class="param-table">
+			<thead>
+				<tr>
+					<th>参数名</th>
+					<th>ID</th>
+					<th>值</th>
+					<th>大小</th>
+					<th>操作</th>
+				</tr>
+			</thead>
+			<tbody id="paramBody"></tbody>
+		</table>
+		<div class="btn-row">
+			<button class="btn-secondary" id="btnReadAll" onclick="readAllParams()">📖 读取全部</button>
+			<button class="btn-primary" id="btnWriteAll" onclick="writeAllParams()">💾 写入全部</button>
+			<button class="btn-danger" id="btnSaveFlash" onclick="saveAllToFlash()">💾 保存到Flash</button>
+			<button class="btn-secondary" id="btnLoadFlash" onclick="loadAllFromFlash()">📂 从Flash加载</button>
+		</div>
+	</div>
+
+	<!-- 调试面板 -->
+	<div class="panel">
+		<h2>📋 日志</h2>
+		<div class="log-box" id="logBox">
+			<div class="log-dim">— 页面已加载 —</div>
+		</div>
+	</div>
+
+	<div class="toast" id="toast"></div>
+
+	<script>
+		// ============================================================
+		//  WebHID 配置工具 - 通用版
+		//  协议匹配固件：
+		//   - CMD_PING      (0x01)：测试连接，返回 PONG
+		//   - CMD_READ_PARAM(0x02)：读取参数值
+		//   - CMD_WRITE_PARAM(0x03)：写入参数值
+		//   - CMD_LIST_PARAMS(0x06)：列出所有参数定义
+		//  参数由 LIST_PARAMS 动态发现，支持任何 VID/PID
+		// ============================================================
+
+		/* ---- 协议常量 ---- */
+		const CMD = {
+			PING: 0x01,
+			READ_PARAM: 0x02,
+			WRITE_PARAM: 0x03,
+			SAVE_ALL: 0x04,
+			LOAD_ALL: 0x05,
+			LIST_PARAMS: 0x06,
+		}
+		const STATUS = { OK: 0x00, BUSY: 0x01, UNKNOWN_CMD: 0x02, INVALID_PARAM: 0x03, INVALID_LEN: 0x04, ERROR: 0xFF }
+		const REPORT_ID = 1
+		const REPORT_SIZE = 64
+
+		/* ---- 状态 ---- */
+		let device = null
+		let paramDefs = {}      // { id: { id, name, size } } - 从 LIST_PARAMS 发现
+		let paramValues = {}    // { id: value }
+
+		// ============================================================
+		//  工具函数
+		// ============================================================
+		function log (msg, cls = 'log-info') {
+			const box = document.getElementById('logBox')
+			const div = document.createElement('div')
+			div.className = cls
+			div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`
+			box.appendChild(div)
+			box.scrollTop = box.scrollHeight
+		}
+
+		function showToast (msg, duration = 2000) {
+			const el = document.getElementById('toast')
+			el.textContent = msg
+			el.classList.add('show')
+			clearTimeout(el._timer)
+			el._timer = setTimeout(() => el.classList.remove('show'), duration)
+		}
+
+		function hexStr (buf) {
+			return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join(' ')
+		}
+
+		function bytesToString (bytes, offset, maxLen) {
+			let end = offset + maxLen
+			while (end > offset && bytes[end - 1] === 0) end--
+			return new TextDecoder().decode(bytes.slice(offset, end))
+		}
+
+		function stringToBytes (str, maxLen) {
+			const enc = new TextEncoder()
+			const b = enc.encode(str)
+			const r = new Uint8Array(maxLen)
+			r.set(b.slice(0, maxLen))
+			return r
+		}
+
+		// ============================================================
+		//  WebHID 通信
+		// ============================================================
+		async function sendCommand (cmd, paramId = 0, data = null) {
+			if (!device) throw new Error('设备未连接')
+			const buf = new Uint8Array(REPORT_SIZE)
+			// 注意：Chrome WebHID 的 sendFeatureReport() 会在数据前
+			// 自动追加 Report ID 字节。所以 USB 数据格式为：
+			//   [Report ID=1][cmd][paramId][dataLen][data...]
+			// 因此 buf 中不要包含 Report ID，直接从 cmd 开始：
+			//   buf[0] = 命令 (CMD_xxx)
+			//   buf[1] = 参数 ID
+			//   buf[2] = 数据长度 (仅 WRITE_PARAM)
+			//   buf[3..] = 数据
+			buf[0] = cmd
+			buf[1] = paramId
+			if (data !== null) {
+				buf[2] = data.length
+				buf.set(data, 3)
+			}
+			log(`→ CMD=0x${cmd.toString(16)} PID=${paramId} LEN=${data ? data.length : 0} [${hexStr(buf.slice(0, 8))}...]`, 'log-dim')
+			try {
+				await device.sendFeatureReport(REPORT_ID, buf)
+			} catch (e) {
+				log(`✗ 发送失败: ${e.message}`, 'log-err')
+				throw e
+			}
+		}
+
+		async function receiveResponse () {
+			if (!device) throw new Error('设备未连接')
+			let dv
+			try {
+				dv = await device.receiveFeatureReport(REPORT_ID)
+			} catch (e) {
+				log(`✗ 接收失败: ${e.message}`, 'log-err')
+				throw e
+			}
+			const bytes = new Uint8Array(dv.buffer)
+			log(`← [${hexStr(bytes.slice(0, 8))}...]`, 'log-dim')
+			// 注意：Chrome WebHID 不会从响应中去掉 Report ID，
+			// 返回的数据包含完整的 Report ID 字节：
+			//   bytes[0] = Report ID (0x01)
+			//   bytes[1] = 状态码
+			//   bytes[2] = 参数 ID
+			//   bytes[3] = 数据长度
+			//   bytes[4..] = 数据
+			return { raw: bytes, reportId: bytes[0], status: bytes[1], paramId: bytes[2], dataLen: bytes[3], data: bytes.slice(4) }
+		}
+
+		async function sendAndReceive (cmd, paramId = 0, data = null) {
+			await sendCommand(cmd, paramId, data)
+			return await receiveResponse()
+		}
+
+		// ============================================================
+		//  发现参数列表
+		// ============================================================
+		async function discoverParams () {
+			log('正在发现参数列表...', 'log-info')
+			const resp = await sendAndReceive(CMD.LIST_PARAMS)
+			if (resp.status !== STATUS.OK) {
+				throw new Error(`LIST_PARAMS 失败, status=0x${resp.status.toString(16)}`)
+			}
+
+			paramDefs = {}
+			let pos = 0
+			const d = resp.data
+			while (pos < resp.dataLen && pos < d.length - 2) {
+				const id = d[pos]
+				const size = d[pos + 1]
+				pos += 2
+				// 读取 null-terminated 名称字符串
+				let nameEnd = pos
+				while (nameEnd < d.length && d[nameEnd] !== 0) nameEnd++
+				const name = bytesToString(d, pos, nameEnd - pos)
+				pos = nameEnd + 1
+
+				paramDefs[id] = { id, name, size }
+				log(`  ✓ 发现参数 #${id}: ${name} (${size} 字节)`, 'log-ok')
+			}
+
+			log(`发现 ${Object.keys(paramDefs).length} 个参数`, 'log-info')
+			return paramDefs
+		}
+
+		// ============================================================
+		//  读取/写入参数
+		// ============================================================
+		async function readParam (id) {
+			const resp = await sendAndReceive(CMD.READ_PARAM, id)
+			if (resp.status !== STATUS.OK) {
+				throw new Error(`读取 #${id} 失败: status=0x${resp.status.toString(16)}`)
+			}
+			const def = paramDefs[id]
+			if (!def) throw new Error(`未知参数 #${id}`)
+
+			let value
+			if (def.size === 1) {
+				value = resp.data[0]
+				if (value >= 128) value -= 256  // signed
+			} else if (def.size <= 4) {
+				value = 0
+				for (let i = 0; i < def.size; i++) value |= resp.data[i] << (i * 8)
+				// signed 32-bit
+				if (def.size === 4 && value >= 0x80000000) value -= 0x100000000
+			} else {
+				value = bytesToString(resp.data, 0, resp.dataLen)
+			}
+
+			paramValues[id] = value
+			log(`✓ 读取 #${id} ${def.name} = ${value}`, 'log-ok')
+			return value
+		}
+
+		async function readAllParams () {
+			setEnabled(false)
+			try {
+				for (const id of Object.keys(paramDefs).map(Number).sort((a, b) => a - b)) {
+					await readParam(id)
+				}
+				updateUI()
+				showToast('已读取所有参数')
+			} catch (e) {
+				log(`✗ 读取失败: ${e.message}`, 'log-err')
+				showToast('读取失败', 3000)
+			} finally {
+				setEnabled(true)
+			}
+		}
+
+		async function writeParam (id, value) {
+			const def = paramDefs[id]
+			if (!def) throw new Error(`未知参数 #${id}`)
+
+			let data
+			if (def.size === 1) {
+				data = new Uint8Array([value & 0xFF])
+			} else if (def.size <= 4) {
+				data = new Uint8Array(def.size)
+				for (let i = 0; i < def.size; i++) data[i] = (value >> (i * 8)) & 0xFF
+			} else {
+				data = stringToBytes(String(value), def.size)
+			}
+
+			const resp = await sendAndReceive(CMD.WRITE_PARAM, id, data)
+			if (resp.status !== STATUS.OK) {
+				throw new Error(`写入 #${id} 失败: status=0x${resp.status.toString(16)}`)
+			}
+			paramValues[id] = value
+			log(`✓ 写入 #${id} ${def.name} = ${value}`, 'log-ok')
+		}
+
+		async function writeAllParams () {
+			// 从 UI 取值
+			for (const idStr of Object.keys(paramDefs)) {
+				const id = parseInt(idStr)
+				const input = document.getElementById(`param_${id}`)
+				if (input) paramValues[id] = input.value
+			}
+
+			setEnabled(false)
+			try {
+				for (const id of Object.keys(paramDefs).map(Number).sort((a, b) => a - b)) {
+					await writeParam(id, paramValues[id])
+				}
+				showToast('已写入全部参数')
+			} catch (e) {
+				log(`✗ 写入失败: ${e.message}`, 'log-err')
+				showToast('写入失败', 3000)
+			} finally {
+				setEnabled(true)
+			}
+		}
+
+		// ============================================================
+		//  保存/加载 Flash
+		// ============================================================
+		async function saveAllToFlash () {
+			setEnabled(false)
+			try {
+				await sendAndReceive(CMD.SAVE_ALL)
+				log('✓ 所有参数已保存到 Flash', 'log-ok')
+				showToast('已保存到 Flash')
+			} catch (e) {
+				log(`✗ 保存到 Flash 失败: ${e.message}`, 'log-err')
+				showToast('保存失败', 3000)
+			} finally {
+				setEnabled(true)
+			}
+		}
+
+		async function loadAllFromFlash () {
+			setEnabled(false)
+			try {
+				await sendAndReceive(CMD.LOAD_ALL)
+				log('✓ 已从 Flash 加载参数', 'log-ok')
+				// 加载后再读取所有参数值更新 UI
+				await readAllParams()
+				showToast('已从 Flash 加载')
+			} catch (e) {
+				log(`✗ 从 Flash 加载失败: ${e.message}`, 'log-err')
+				showToast('加载失败', 3000)
+			} finally {
+				setEnabled(true)
+			}
+		}
+
+		// ============================================================
+		//  设备过滤信息本地存储
+		//  功能：连接成功的设备 VID/PID 保存到本地，
+		//  下次打开时用此过滤，弹出窗口只显示正确的设备
+		// ============================================================
+		const FILTER_KEY = 'nrf_webhid_device_filter'
+
+		function saveDeviceFilter (vid, pid, name) {
+			const data = {
+				vendorId: vid,
+				productId: pid,
+				productName: name,
+				savedAt: new Date().toISOString()
+			}
+			try {
+				localStorage.setItem(FILTER_KEY, JSON.stringify(data))
+				log(`✓ 已记住设备: ${name} [${vid.toString(16)}:${pid.toString(16)}]`, 'log-ok')
+			} catch (e) {
+				log(`✗ 保存过滤信息失败: ${e.message}`, 'log-err')
+			}
+		}
+
+		function loadDeviceFilter () {
+			try {
+				const raw = localStorage.getItem(FILTER_KEY)
+				if (!raw) return null
+				return JSON.parse(raw)
+			} catch (e) {
+				return null
+			}
+		}
+
+		function clearDeviceFilter () {
+			localStorage.removeItem(FILTER_KEY)
+			log('已清除保存的设备过滤信息', 'log-dim')
+		}
+
+		// ============================================================
+		//  UI
+		// ============================================================
+		function buildParamTable () {
+			const tbody = document.getElementById('paramBody')
+			tbody.innerHTML = ''
+			document.getElementById('paramCount').textContent = ''
+
+			const ids = Object.keys(paramDefs).map(Number).sort((a, b) => a - b)
+			for (const id of ids) {
+				const p = paramDefs[id]
+				const tr = document.createElement('tr')
+
+				// 名称
+				const tdN = document.createElement('td')
+				tdN.className = 'param-name'
+				tdN.textContent = p.name
+
+				// ID
+				const tdI = document.createElement('td')
+				tdI.className = 'param-id'
+				tdI.textContent = id
+
+				// 值
+				const tdV = document.createElement('td')
+				const inp = document.createElement('input')
+				inp.id = `param_${id}`
+				if (p.size > 4) {
+					inp.type = 'text'
+					inp.placeholder = '(字符串)'
+				} else {
+					inp.type = 'number'
+				}
+				if (paramValues[id] !== undefined) inp.value = paramValues[id]
+				tdV.appendChild(inp)
+
+				// 大小
+				const tdS = document.createElement('td')
+				tdS.textContent = `${p.size} B`
+				tdS.style.cssText = 'color:var(--text-dim);font-size:12px;'
+
+				// 操作：单个写入按钮
+				const tdA = document.createElement('td')
+				const btn = document.createElement('button')
+				btn.className = 'btn-small'
+				btn.id = `btnWrite_${id}`
+				btn.textContent = '写入'
+				btn.onclick = async () => {
+					const val = document.getElementById(`param_${id}`).value
+					btn.disabled = true
+					try {
+						await writeParam(id, val)
+						showToast(`#${id} 已写入`)
+					} catch (e) {
+						showToast(`写入 #${id} 失败`, 3000)
+					} finally {
+						btn.disabled = false
+					}
+				}
+				tdA.appendChild(btn)
+
+				tr.appendChild(tdN)
+				tr.appendChild(tdI)
+				tr.appendChild(tdV)
+				tr.appendChild(tdS)
+				tr.appendChild(tdA)
+				tbody.appendChild(tr)
+			}
+
+			document.getElementById('paramCount').textContent = `(${ids.length} 个)`
+		}
+
+		function updateUI () {
+			for (const idStr of Object.keys(paramDefs)) {
+				const id = parseInt(idStr)
+				const inp = document.getElementById(`param_${id}`)
+				if (inp && paramValues[id] !== undefined) inp.value = paramValues[id]
+			}
+		}
+
+		function setEnabled (en) {
+			for (const id of ['btnReadAll', 'btnWriteAll', 'btnSaveFlash', 'btnLoadFlash']) {
+				document.getElementById(id).disabled = !en
+			}
+		}
+
+		function updateConnUI (ok) {
+			const st = document.getElementById('statusText')
+			const bc = document.getElementById('btnConnect')
+			const bd = document.getElementById('btnDisconnect')
+			const pnl = document.getElementById('configPanel')
+			if (ok) {
+				st.innerHTML = '<span class="status-dot connected"></span>已连接'
+				bc.textContent = '🔗 换设备'
+				bd.disabled = false
+				pnl.classList.remove('disabled')
+			} else {
+				st.innerHTML = '<span class="status-dot disconnected"></span>未连接'
+				bc.textContent = '🔗 连接设备'
+				bd.disabled = true
+				pnl.classList.add('disabled')
+			}
+		}
+
+		// ============================================================
+		//  连接后的初始化流程（PING → 发现参数 → 构建UI → 读取值）
+		// ============================================================
+		async function runInitSequence () {
+			// 清空旧数据
+			document.getElementById('logBox').innerHTML = ''
+			paramDefs = {}
+			paramValues = {}
+
+			// 1. PING
+			const pingResp = await sendAndReceive(CMD.PING)
+			if (pingResp.status !== STATUS.OK) {
+				log('⚠ PING 失败，设备可能不支持此协议', 'log-warn')
+			} else {
+				const ver = `${pingResp.data[5]}.${pingResp.data[6]}`
+				log(`✓ 固件版本 ${ver}`, 'log-ok')
+			}
+
+			// 2. 发现参数
+			await discoverParams()
+
+			// 3. 构建 UI
+			buildParamTable()
+
+			// 4. 读取设备当前值
+			await readAllParams()
+		}
+
+		// ============================================================
+		//  连接管理
+		// ============================================================
+		async function connectDevice () {
+			if (device) await disconnectDevice()
+			if (!navigator.hid) {
+				log('✗ 浏览器不支持 WebHID。请用 Chrome/Edge', 'log-err')
+				showToast('浏览器不支持 WebHID', 3000)
+				return
+			}
+
+			try {
+				// 使用保存的 VID/PID 做过滤，弹出窗口只显示正确的设备
+				const savedFilter = loadDeviceFilter()
+				const filters = [{ usagePage: 0xFF00 }]
+
+				if (savedFilter) {
+					filters.push({
+						vendorId: savedFilter.vendorId,
+						productId: savedFilter.productId,
+					})
+					log(`使用已记住的设备过滤: ${savedFilter.productName}`, 'log-info')
+				}
+
+				log('正在请求 HID 设备...', 'log-info')
+				log('请在弹出窗口中选择你的开发板', 'log-dim')
+
+				const devices = await navigator.hid.requestDevice({ filters })
+
+				if (devices.length === 0) {
+					log('✗ 未选择设备', 'log-err')
+					return
+				}
+
+				device = devices[0]
+				log(`已选择: ${device.productName}`, 'log-info')
+				log(`  VID=0x${device.vendorId.toString(16)} PID=0x${device.productId.toString(16)}`, 'log-dim')
+				document.getElementById('deviceInfo').textContent =
+					`${device.productName} [${device.vendorId.toString(16)}:${device.productId.toString(16)}]`
+
+				if (!device.opened) {
+					await device.open()
+					log('✓ 设备已打开', 'log-ok')
+				} else {
+					log('✓ 设备已处于打开状态', 'log-ok')
+				}
+				updateConnUI(true)
+
+				// 连接成功后自动保存 VID/PID，下次直接用此过滤
+				saveDeviceFilter(device.vendorId, device.productId, device.productName)
+
+				await runInitSequence()
+
+			} catch (e) {
+				log(`✗ 连接失败: ${e.message}`, 'log-err')
+				showToast(`连接失败`, 4000)
+				device = null
+				updateConnUI(false)
+			}
+		}
+
+		async function disconnectDevice () {
+			if (!device) return
+			try {
+				if (device.opened) {
+					await device.close()
+				}
+				log('设备已断开', 'log-dim')
+			} catch (e) {
+				log(`断开出错: ${e.message}`, 'log-err')
+			}
+			device = null
+			updateConnUI(false)
+			document.getElementById('deviceInfo').textContent = ''
+			document.getElementById('logBox').innerHTML = '<div class="log-dim">— 已断开 —</div>'
+		}
+
+		// ============================================================
+		//  事件监听 & 初始化
+		// ============================================================
+		if (navigator.hid) {
+			// 监听设备断开
+			navigator.hid.addEventListener('disconnect', (e) => {
+				if (device && e.device === device) {
+					log('⚠ 设备已断开连接', 'log-warn')
+					device = null
+					updateConnUI(false)
+					document.getElementById('deviceInfo').textContent = ''
+				}
+			})
+
+			// 页面关闭/刷新前主动关闭设备，释放 HID 接口
+			window.addEventListener('beforeunload', () => {
+				if (device && device.opened) {
+					device.close().catch(() => { })
+				}
+			})
+		}
+
+		log('请点击"连接设备"', 'log-dim')
+	</script>
+</body>
+
+</html>

@@ -1,0 +1,3 @@
+# Kconfig - 引入官方 sample 的 USB 配置项
+source "samples/subsys/usb/common/Kconfig.sample_usbd"
+source "Kconfig.zephyr"
