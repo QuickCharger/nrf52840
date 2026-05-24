@@ -1435,7 +1435,15 @@ static void scan_timeout_handler(struct k_work *work)
 static void auto_connect_timeout_handler(struct k_work *work)
 {
 	LOG_INF("Auto connect timeout, stopping and falling back to BLE scan...");
+	cdc_acm_print("CDC: Auto connect timeout, fallback to scan\r\n");
 	bt_conn_create_auto_stop();
+
+	/* 清除绑定地址验证，允许扫描模式连接到任何 M720（包括新设备槽）。
+	 * 如果鼠标切换到了不同的设备槽（比如从槽3切换到槽2重新配对），
+	 * 旧绑定地址与新地址不同，不清除的话 device_found() 会忽略新地址。
+	 * 新连接后 BLE 栈会重新配对并覆盖旧绑定。
+	 */
+	mouse_bond_addr_valid = false;
 	start_ble_scan();
 }
 
@@ -1537,6 +1545,14 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 	/* 信号够强才打印日志 */
 	LOG_INF("DEVICE: %s, RSSI %d, type %u", dev, rssi, type);
+	{
+		char cdc_buf[80];
+		int n = snprintf(cdc_buf, sizeof(cdc_buf),
+			"CDC: Found %s RSSI=%d\r\n", dev, rssi);
+		if (n > 0 && n < (int)sizeof(cdc_buf)) {
+			cdc_acm_print(cdc_buf);
+		}
+	}
 
 	/* 只处理可连接广播 */
 	if (type != BT_GAP_ADV_TYPE_ADV_IND &&
@@ -1560,19 +1576,25 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	 * 但连接过去会因密钥不匹配导致 0x3e。
 	 *
 	 * 精确匹配确保只连回之前绑定的那个设备槽。
+	 *
+	 * 注意：如果鼠标切换到了新设备槽（配对模式），auto_connect 超时后会
+	 * 清除 mouse_bond_addr_valid，允许扫描连接到任何 M720。
 	 */
 	if (mouse_bond_addr_valid) {
 		/* 只连接已绑定的精确地址 */
 		if (bt_addr_le_cmp(addr, &mouse_bond_addr) == 0) {
 			LOG_INF("*** Bonded device found: %s! ***", dev);
+			cdc_acm_print("CDC: Bonded device found, connecting...\r\n");
 			bt_data_parse(ad, eir_check_hid_mouse, (void *)addr);
 		} else {
-			LOG_DBG("Not bonded address (%s), skip", dev);
+			cdc_acm_print("CDC: Skip (addr mismatch, waiting timeout)\r\n");
+			LOG_INF("Skip %s (addr not match bonded, waiting for auto-connect timeout)", dev);
 		}
 	} else {
-		/* 首次连接：使用 MAC 前缀匹配发现 M720 */
+		/* 首次连接或 auto-connect 已超时：使用 MAC 前缀匹配发现 M720 */
 		if (memcmp(&addr->a.val[1], target_mac_prefix, 5) == 0) {
 			LOG_INF("*** MAC prefix matched %s! Checking EIR data... ***", dev);
+			cdc_acm_print("CDC: MAC matched, checking HID service...\r\n");
 			bt_data_parse(ad, eir_check_hid_mouse, (void *)addr);
 		} else {
 			LOG_DBG("MAC prefix mismatch");
@@ -1602,6 +1624,7 @@ static void start_ble_scan(void)
 		return;
 	}
 
+	cdc_acm_print("CDC: BLE scan started (RSSI>=-55dBm)\r\n");
 	LOG_INF("BLE scanning for HID mouse (RSSI >= %d dBm)...",
 		BLE_HID_RSSI_THRESHOLD);
 }
