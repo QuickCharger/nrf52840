@@ -1,8 +1,5 @@
 /*
- * Copyright (c) 2018 qianfan Zhao
- * Copyright (c) 2018, 2023 Nordic Semiconductor ASA
- *
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 qianfan Zhao
  *
  * USB HID Mouse + Keyboard + BLE HID Client (HOGP)
  *
@@ -11,31 +8,29 @@
  * - BLE Central: 扫描并连接蓝牙鼠标(HID Service), 通过HOGP Client接收鼠标报告
  */
 
-#include <sample_usbd.h>
+/*
+svc有多个，svc和char是从属关系, svc下面有多个char， 然后char下面有一个声明和一个值和多个descriptor组成。
+*/
 
 #include <string.h>
 #include <errno.h>
-
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/byteorder.h>
-
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_hid.h>
 #include <zephyr/drivers/uart.h>
-
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
-
 #include <bluetooth/gatt_dm.h>
-
 #include <zephyr/settings/settings.h>
-
 #include <zephyr/logging/log.h>
+
+
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 /* ============================================================
@@ -52,16 +47,22 @@ static void cdc_acm_print(const char *str)
 		return;
 	}
 
-	if (!device_is_ready(cdc_acm_dev)) {
-		LOG_WRN("CDC ACM device not ready, cannot print: %s", str);
-		return;
-	}
-
 	while (*str) {
 		uart_poll_out(cdc_acm_dev, *str);
 		str++;
 	}
 }
+
+
+#define CDC_LOG(fmt, ...) do { \
+	char _b[128]; int _n = snprintf(_b, sizeof(_b), fmt "\r\n", ##__VA_ARGS__); \
+	if (_n > 0 && _n < (int)sizeof(_b)) cdc_acm_print(_b); \
+} while (0)
+
+#define CDC_ERR(fmt, ...) do { \
+	char _b[128]; int _n = snprintf(_b, sizeof(_b), "ERR: " fmt "\r\n", ##__VA_ARGS__); \
+	if (_n > 0 && _n < (int)sizeof(_b)) cdc_acm_print(_b); \
+} while (0)
 
 /* ============================================================
  *  RSSI 阈值：信号强度 >= 此值时尝试连接
@@ -69,9 +70,6 @@ static void cdc_acm_print(const char *str)
  *  设为 -55 只扫描 1 米以内的设备
  * ============================================================ */
 #define BLE_HID_RSSI_THRESHOLD  (-55)
-
-/* 调试阶段：直接指定鼠标 MAC 地址 */
-#define BLE_MOUSE_TARGET_MAC   "FB:DE:BD:46:FF:0B"
 
 /* ============================================================
  *  鼠标相关 (USB HID)
@@ -102,74 +100,156 @@ static bool mouse_ready;
 static bt_addr_le_t mouse_bond_addr;
 static bool mouse_bond_addr_valid;
 
-/* 从 7 字节鼠标报告中提取 12-bit 有符号 X/Y 值，缩放到 [-127, 127]
- *
- * HID Report Map (Report ID 2) 位布局:
- *   Byte 0-1: buttons[15:0]  (16 × 1 bit)
- *   Byte 2:   X[7:0]         (低 8 位)
- *   Byte 3:   X[11:8] | Y[3:0]<<4  (X 高 4 位 + Y 低 4 位打包在同一字节)
- *   Byte 4:   Y[11:4]        (Y 高 8 位)
- *   Byte 5:   Wheel (signed 8-bit)
- *   Byte 6:   AC Pan (signed 8-bit, 水平滚轮)
- *
- * 12-bit 有符号值范围: -2047 ~ 2047
- * USB HID 8-bit 范围: -127 ~ 127
- */
-static void unpack_mouse_report_7byte(const uint8_t *data,
-				      uint8_t *report)
+struct hid_rpt_field {
+	bool     found;
+	uint8_t  report_id;
+	uint16_t bit_offset;
+	uint16_t bit_size;
+	int32_t  logical_min;
+	int32_t  logical_max;
+};
+
+struct hid_mouse_layout {
+	struct hid_rpt_field buttons;
+	struct hid_rpt_field x;
+	struct hid_rpt_field y;
+	struct hid_rpt_field wheel;
+	struct hid_rpt_field ac_pan;
+};
+
+static struct hid_mouse_layout g_mouse_layout;
+
+static bool parse_hid_report_map(const uint8_t *data, uint16_t len,
+				 struct hid_mouse_layout *out)
 {
-	/* 7 字节报告布局 (HID Report ID 2):
-	 *   data[0] = buttons byte 0 (bit0=左键, bit1=右键, bit2=中键,
-	 *                                bit3=后退, bit4=前进)
-	 *   data[1] = buttons byte 1 (保留)
-	 *   data[2] = X[7:0]       (低 8 位)
-	 *   data[3] = X[11:8] | Y[3:0]<<4  (X 高 4 位 + Y 低 4 位)
-	 *   data[4] = Y[11:4]      (Y 高 8 位)
-	 *   data[5] = Wheel (signed 8-bit)
-	 *   data[6] = AC Pan (水平滚轮, signed 8-bit)
-	 */
+	uint32_t g_usage_page = 0, g_report_size = 0, g_report_count = 0;
+	int32_t  g_logical_min = 0, g_logical_max = 0;
+	uint8_t  g_report_id = 0;
+	uint16_t local_usages[8];
+	uint8_t  local_usage_cnt = 0;
+	uint16_t total_bit_offset = 0;
 
-	/* 提取 X: 12-bit 无符号 */
-	uint16_t x_raw = (uint16_t)(data[2] | ((data[3] & 0x0F) << 8));
-	/* 提取 Y: 12-bit 无符号 */
-	uint16_t y_raw = (uint16_t)(((data[3] >> 4) & 0x0F) | (data[4] << 4));
+	memset(out, 0, sizeof(*out));
 
-	/* 转换为 12-bit 有符号 (二进制补码, 范围 -2047~2047) */
-	int16_t x_val = (x_raw >= 0x0800) ? (int16_t)(x_raw - 4096) : (int16_t)x_raw;
-	int16_t y_val = (y_raw >= 0x0800) ? (int16_t)(y_raw - 4096) : (int16_t)y_raw;
+	for (uint16_t i = 0; i < len; ) {
+		uint8_t item = data[i];
+		uint8_t bSize = item & 0x03;
+		uint8_t bType = (item >> 2) & 0x03;
+		uint8_t bTag  = (item >> 4) & 0x0F;
 
-	/* 直接截断到 USB HID 8-bit 范围 [-127, 127]
-	 * 不缩放: 12-bit 值的 ±2047 范围很少用到,
-	 * 实际移动幅度通常 <127, 缩放反而导致小移动被舍入为 0
-	 */
+		if (bSize == 3) bSize = 4;
+		i++;
+
+		int32_t val = 0;
+		for (uint8_t j = 0; j < bSize; j++) {
+			val |= ((int32_t)data[i + j]) << (j * 8);
+		}
+		
+		if (bSize == 1 && (val & 0x80))        val |= ~0xFFL;
+		else if (bSize == 2 && (val & 0x8000))  val |= ~0xFFFFL;
+		i += bSize;
+
+		if (bType == 0) { /* Main */
+			if (bTag == 0x8) { /* Input */
+				uint16_t bs = (uint16_t)(g_report_size * g_report_count);
+				for (uint8_t u = 0; u < local_usage_cnt; u++) {
+					uint16_t usage = local_usages[u];
+					struct hid_rpt_field *f = NULL;
+
+					if (g_usage_page == 0x09 && usage >= 1 && usage <= 5) {
+						f = &out->buttons;
+					} else if (g_usage_page == 0x01) {
+						if (usage == 0x30) f = &out->x;
+						else if (usage == 0x31) f = &out->y;
+						else if (usage == 0x38) f = &out->wheel;
+					} else if (g_usage_page == 0x0C && usage == 0x0238) {
+						f = &out->ac_pan;
+					}
+
+					if (f && !f->found) {
+						f->found = true;
+						f->report_id = g_report_id;
+						f->bit_offset = total_bit_offset + u * g_report_size;
+						f->bit_size = g_report_size;
+						f->logical_min = g_logical_min;
+						f->logical_max = g_logical_max;
+					}
+				}
+				total_bit_offset += bs;
+				local_usage_cnt = 0;
+			}
+		} else if (bType == 1) { /* Global */
+			switch (bTag) {
+			case 0x0: g_usage_page = (uint32_t)val; break;
+			case 0x1: g_logical_min = val; break;
+			case 0x2: g_logical_max = val; break;
+			case 0x7: g_report_size = (uint32_t)val; break;
+			case 0x8: g_report_id = (uint8_t)val;
+				  total_bit_offset = 0; /* ? Report ID, ???? */
+				  break;
+			case 0x9: g_report_count = (uint32_t)val; break;
+			}
+		} else if (bType == 2 && bTag == 0x0) { /* Local: Usage */
+			if (g_usage_page == 0x0C && bSize == 2) {
+				/* Consumer page uses 16-bit usages */
+				val = (uint16_t)val;
+			}
+			if (local_usage_cnt < ARRAY_SIZE(local_usages)) {
+				local_usages[local_usage_cnt++] = (uint16_t)val;
+			}
+		}
+	}
+
+	return out->x.found;
+}
+
+static void extract_mouse_report(const uint8_t *data, uint16_t len,
+				 const struct hid_mouse_layout *layout,
+				 uint8_t *report)
+{
+	report[MOUSE_BTN_REPORT_IDX] = 0;
+	report[MOUSE_X_REPORT_IDX] = 0;
+	report[MOUSE_Y_REPORT_IDX] = 0;
+	report[MOUSE_WHEEL_REPORT_IDX] = 0;
+
+	if (!layout->x.found) return;
+
+#define FIELD_VAL(f) _extract_field(data, len, &(f))
+#define _extract_field(d, dl, fld) ({ \
+	int32_t _v = 0; \
+	if ((fld)->found && (fld)->bit_offset + (fld)->bit_size <= (dl) * 8) { \
+		uint16_t bo = (fld)->bit_offset; \
+		uint16_t bs = (fld)->bit_size; \
+		for (uint16_t _i = 0; _i < bs; _i++) { \
+			uint16_t byte_idx = (bo + _i) / 8; \
+			uint8_t  bit_idx  = (bo + _i) % 8; \
+			if ((d)[byte_idx] & (1 << bit_idx)) _v |= (1 << _i); \
+		} \
+		/* ??????? */ \
+		if (_v & (1 << (bs - 1))) _v |= ~((1 << bs) - 1); \
+	} \
+	_v; \
+})
+
+	int32_t x_val = FIELD_VAL(layout->x);
+	int32_t y_val = FIELD_VAL(layout->y);
+	int32_t wheel  = FIELD_VAL(layout->wheel);
+
 	if (x_val > 127) x_val = 127;
 	if (x_val < -127) x_val = -127;
 	if (y_val > 127) y_val = 127;
 	if (y_val < -127) y_val = -127;
 
-	/* 按钮: data[0] 低 5 位 = 左键/右键/中键/后退/前进 */
-	report[MOUSE_BTN_REPORT_IDX] = data[0] & 0x1F;
+	if (layout->buttons.found) {
+		int32_t btn = FIELD_VAL(layout->buttons);
+		report[MOUSE_BTN_REPORT_IDX] = (uint8_t)(btn & 0x1F);
+	}
+
 	report[MOUSE_X_REPORT_IDX] = (uint8_t)x_val;
 	report[MOUSE_Y_REPORT_IDX] = (uint8_t)y_val;
-
-	/* 滚轮 */
-	report[MOUSE_WHEEL_REPORT_IDX] = data[5];
+	report[MOUSE_WHEEL_REPORT_IDX] = (uint8_t)wheel;
 }
 
-/* BLE 鼠标通知回调 - 根据 HID Report Map 解析鼠标报告
- *
- * M720 通过多个特征值发送数据:
- *   [1] Boot Mouse (0x2A4B) 3 字节: [buttons, X(int8), Y(int8)]
- *   [2] Report (0x2A4D) handle 0x0030 7 字节: HID Report ID 2 鼠标报告
- *       (见 unpack_mouse_report_7byte 的位布局)
- *   [3] Report (0x2A4D) handle 0x0034 19 字节: Report ID 0x11 (17),
- *       Logitech HID++ 厂商报告, data[0]!=0xFF 但通过 len==19 识别
- *
- * 处理策略:
- *   - len == 19 → Logitech HID++ 报告, 跳过
- *   - len <= 3  → Boot Mouse 格式 [buttons, X(int8), Y(int8)]
- *   - len >= 7  → Report ID 2 格式, 用 unpack_mouse_report_7byte 解析
- */
 static void ble_mouse_report_forward(const uint8_t *data, uint16_t len)
 {
 	uint8_t report[MOUSE_REPORT_COUNT] = {0};
@@ -179,63 +259,52 @@ static void ble_mouse_report_forward(const uint8_t *data, uint16_t len)
 		return;
 	}
 
-	/* 使用 LOG_HEXDUMP_INF 替代手动 snprintf 循环，
-	 * 避免在 BLE 回调栈上分配 256 字节缓冲区引发栈溢出。
-	 * LOG_HEXDUMP_INF 使用 logger 内部格式化，不占调用者栈空间。
-	 */
-	LOG_HEXDUMP_INF(data, MIN(len, 64), "BLE RAW");
-
-	/* ---- 打印按钮位（前 2 字节）---- */
-	if (len >= 1) {
-		LOG_INF("BTN: byte0=0x%02x byte1=0x%02x "
-			"L=%d R=%d M=%d B4=%d F5=%d",
-			data[0], (len > 1) ? data[1] : 0,
-			(data[0] >> 0) & 1,  /* Left   */
-			(data[0] >> 1) & 1,  /* Right  */
-			(data[0] >> 2) & 1,  /* Middle */
-			(data[0] >> 3) & 1,  /* Back   */
-			(data[0] >> 4) & 1); /* Forward */
-	}
-
-	/* 跳过 19 字节 Logitech HID++ 报告 (Report ID 0x11) */
 	if (len == 19) {
 		return;
 	}
 
-	if (len <= 3) {
+	if (g_mouse_layout.x.found) {
+		extract_mouse_report(data, len, &g_mouse_layout, report);
+	} else if (len <= 3) {
 		/* Boot Mouse 格式: [buttons(1B), X(int8), Y(int8)] */
 		report[MOUSE_BTN_REPORT_IDX] = data[0];
 		report[MOUSE_X_REPORT_IDX] = data[1];
 		report[MOUSE_Y_REPORT_IDX] = data[2];
-		LOG_INF("Boot -> btn=0x%02x X=%d Y=%d",
-			data[0], (int8_t)data[1], (int8_t)data[2]);
+	} else if (len >= 7) {
+		/* M720 7-byte Report ID 2 
+		 * data[0]=buttons, data[2]=X[7:0], data[3]??4bit=X[11:8],
+		 * data[3]??4bit=Y[3:0], data[4]=Y[11:4], data[5]=wheel */
+		uint16_t x_raw = (uint16_t)(data[2] | ((data[3] & 0x0F) << 8));
+		uint16_t y_raw = (uint16_t)(((data[3] >> 4) & 0x0F) | (data[4] << 4));
+		int16_t x_val = (x_raw >= 0x0800) ? (int16_t)(x_raw - 4096) : (int16_t)x_raw;
+		int16_t y_val = (y_raw >= 0x0800) ? (int16_t)(y_raw - 4096) : (int16_t)y_raw;
+		if (x_val > 127) x_val = 127;
+		if (x_val < -127) x_val = -127;
+		if (y_val > 127) y_val = 127;
+		if (y_val < -127) y_val = -127;
+		report[MOUSE_BTN_REPORT_IDX] = data[0] & 0x1F;
+		report[MOUSE_X_REPORT_IDX] = (uint8_t)x_val;
+		report[MOUSE_Y_REPORT_IDX] = (uint8_t)y_val;
+		report[MOUSE_WHEEL_REPORT_IDX] = data[5];
 	} else {
-		/* 7 字节 Report ID 2 格式 */
-		unpack_mouse_report_7byte(data, report);
+		report[MOUSE_BTN_REPORT_IDX] = data[0] & 0x1F;
+		report[MOUSE_X_REPORT_IDX] = data[1];
+		report[MOUSE_Y_REPORT_IDX] = data[2];
 	}
 
-	/* 打印最终发送到 USB 的报告内容 */
-	LOG_INF("USB: [btn=0x%02x X=%d Y=%d wheel=%d]",
+	CDC_LOG("[MOUSE] USB send: btn=0x%02x X=%d Y=%d wheel=%d",
 		report[MOUSE_BTN_REPORT_IDX],
 		(int8_t)report[MOUSE_X_REPORT_IDX],
 		(int8_t)report[MOUSE_Y_REPORT_IDX],
 		(int8_t)report[MOUSE_WHEEL_REPORT_IDX]);
 
-	/* 通过 CDC ACM 输出按钮事件（方便观察哪些按钮被按下） */
-	if (data[0] != 0) {
-		/* 只在有按钮按下时输出 */
+	if (report[MOUSE_BTN_REPORT_IDX] != 0) {
 		char buf[64];
+		uint8_t b = report[MOUSE_BTN_REPORT_IDX];
 		int n = snprintf(buf, sizeof(buf),
-			"BTN: raw=0x%02x L=%d R=%d M=%d B4=%d F5=%d\r\n",
-			data[0],
-			(data[0] >> 0) & 1,  /* Left   */
-			(data[0] >> 1) & 1,  /* Right  */
-			(data[0] >> 2) & 1,  /* Middle */
-			(data[0] >> 3) & 1,  /* Back   */
-			(data[0] >> 4) & 1); /* Forward */
-		if (n > 0 && n < (int)sizeof(buf)) {
-			cdc_acm_print(buf);
-		}
+			"BTN: 0x%02x L=%d R=%d M=%d B4=%d F5=%d\r\n",
+			b, (b>>0)&1, (b>>1)&1, (b>>2)&1, (b>>3)&1, (b>>4)&1);
+		if (n > 0 && n < (int)sizeof(buf)) cdc_acm_print(buf);
 	}
 
 	if (k_msgq_put(&mouse_msgq, report, K_NO_WAIT) != 0) {
@@ -909,7 +978,25 @@ static uint8_t report_map_read_cb(struct bt_conn *conn, uint8_t err,
 		LOG_INF("  %04x: %-48s %s", i, hex, ascii);
 	}
 
-	/* TODO: 解析 Report Map 中 Input Report 格式，自动确定 X/Y 偏移 */
+	if (parse_hid_report_map(report_map_data, report_map_len, &g_mouse_layout)) {
+		CDC_LOG("=== Report Map parsed OK ===");
+		CDC_LOG("  X:     offset=%u size=%u min=%d max=%d",
+			g_mouse_layout.x.bit_offset, g_mouse_layout.x.bit_size,
+			g_mouse_layout.x.logical_min, g_mouse_layout.x.logical_max);
+		CDC_LOG("  Y:     offset=%u size=%u min=%d max=%d",
+			g_mouse_layout.y.bit_offset, g_mouse_layout.y.bit_size,
+			g_mouse_layout.y.logical_min, g_mouse_layout.y.logical_max);
+		if (g_mouse_layout.buttons.found)
+			CDC_LOG("  BTN:   offset=%u size=%u",
+				g_mouse_layout.buttons.bit_offset,
+				g_mouse_layout.buttons.bit_size);
+		if (g_mouse_layout.wheel.found)
+			CDC_LOG("  WHEEL: offset=%u size=%u",
+				g_mouse_layout.wheel.bit_offset,
+				g_mouse_layout.wheel.bit_size);
+	} else {
+		CDC_LOG("Report Map parse FAILED, will use fallback extraction");
+	}
 
 	return BT_GATT_ITER_STOP;
 }
@@ -927,7 +1014,7 @@ static uint8_t mouse_notify_cb(struct bt_conn *conn,
 		return BT_GATT_ITER_STOP;
 	}
 
-	LOG_INF("BLE mouse report received: %u bytes from handle 0x%04x",
+	CDC_LOG("[MOUSE] BLE report: %u bytes handle=0x%04x",
 		length, params->value_handle);
 
 	/* 将 BLE 鼠标数据转发到 USB HID */
@@ -954,29 +1041,145 @@ static void conn_status_handler(struct k_work *work)
 
 /* ---------- GATT Discovery Manager 回调 ---------- */
 
-/* 打印发现的属性 - 调试用 */
+/* 通用 GATT 读取回调: 打印任何特征值的 hex dump */
+struct generic_read_ctx {
+	struct bt_gatt_read_params params;
+	char name[BT_UUID_STR_LEN];  /* 复制字符串，避免栈变量失效 */
+};
+static uint8_t generic_read_cb(struct bt_conn *conn, uint8_t err,
+			       struct bt_gatt_read_params *params,
+			       const void *data, uint16_t length)
+{
+	struct generic_read_ctx *ctx = CONTAINER_OF(params,
+					struct generic_read_ctx, params);
+	if (!err && data && length > 0) {
+		CDC_LOG("  VALUE(%s): %u bytes", ctx->name ? ctx->name : "?",
+			length);
+		char hex[65]; int pos = 0;
+		for (uint16_t i = 0; i < MIN(length, 32); i++) {
+			pos += snprintf(hex + pos, sizeof(hex) - pos,
+					"%02x ", ((uint8_t*)data)[i]);
+		}
+		if (pos > 0) CDC_LOG("    hex: %s", hex);
+	} else if (err) {
+		CDC_LOG("  Read %s failed: err=%d",
+			ctx->name ? ctx->name : "?", err);
+	}
+	return BT_GATT_ITER_STOP;
+}
+
+static uint8_t all_services_cb(struct bt_conn *conn,
+			       const struct bt_gatt_attr *attr,
+			       struct bt_gatt_discover_params *params);
+
+/* 串行读取: 全局变量 + 回调 */
+static uint16_t g_read_queue[32];
+static int g_read_cnt;
+static int g_read_idx;
+static bool g_serial_read_done;  /* 重连时重置 */
+
+static uint8_t serial_read_cb(struct bt_conn *conn, uint8_t err,
+			      struct bt_gatt_read_params *params,
+			      const void *data, uint16_t length)
+{
+	if (!err && data && length > 0) {
+		CDC_LOG("  VALUE(0x%04x): %u bytes", params->single.handle, length);
+		char hex[65]; int pos = 0;
+		for (uint16_t i = 0; i < MIN(length, 32); i++) {
+			pos += snprintf(hex + pos, sizeof(hex) - pos,
+					"%02x ", ((uint8_t*)data)[i]);
+		}
+		if (pos > 0) CDC_LOG("    hex: %s", hex);
+	}
+	g_read_idx++;
+	if (g_read_idx < g_read_cnt) {
+		static struct bt_gatt_read_params rp;
+		rp.func = serial_read_cb;
+		rp.handle_count = 1;
+		rp.single.handle = g_read_queue[g_read_idx];
+		rp.single.offset = 0;
+		bt_gatt_read(ble_conn, &rp);
+	} else {
+		CDC_LOG("=== All values read: %d ===", g_read_cnt);
+		/* 串行读完成，现在遍历所有 Service */
+		static struct bt_gatt_discover_params svc_disc;
+		svc_disc.uuid = NULL;
+		svc_disc.func = all_services_cb;
+		svc_disc.start_handle = 0x0001;
+		svc_disc.end_handle = 0xFFFF;
+		svc_disc.type = BT_GATT_DISCOVER_PRIMARY;
+		bt_gatt_discover(ble_conn, &svc_disc);
+	}
+	return BT_GATT_ITER_STOP;
+}
+
+static void serial_read_start(struct k_work *work)
+{
+	if (g_read_cnt > 0) {
+		g_read_idx = 0;
+		static struct bt_gatt_read_params rp;
+		rp.func = serial_read_cb;
+		rp.handle_count = 1;
+		rp.single.handle = g_read_queue[0];
+		rp.single.offset = 0;
+		CDC_LOG("Serial read: %d handles", g_read_cnt);
+		bt_gatt_read(ble_conn, &rp);
+	}
+}
+
 static void print_discovered_attrs(struct bt_gatt_dm *dm)
 {
 	const struct bt_gatt_dm_attr *attr = NULL;
 
-	LOG_INF("--- Discovered HID Service attributes ---");
-	/* 先打印度服务 */
-	attr = bt_gatt_dm_service_get(dm);
-	if (attr) {
-		char uuid_str[BT_UUID_STR_LEN];
-		bt_uuid_to_str(attr->uuid, uuid_str, sizeof(uuid_str));
-		LOG_INF("  Service: %s handle=0x%04x", uuid_str, attr->handle);
-	}
-
-	/* 遍历所有特征值和描述符 */
+	CDC_LOG("=== HID Service (0x1812) attributes ===");
+	/* 遍历所有属性和特征值 */
 	attr = NULL;
 	while ((attr = bt_gatt_dm_attr_next(dm, attr)) != NULL) {
 		char uuid_str[BT_UUID_STR_LEN];
 		bt_uuid_to_str(attr->uuid, uuid_str, sizeof(uuid_str));
-		LOG_INF("  Attr: %s handle=0x%04x perm=0x%02x",
-			uuid_str, attr->handle, attr->perm);
+
+		/* 识别 attribute 类型并标记 */
+		const char *tag = "";
+		if (attr->uuid->type == BT_UUID_TYPE_16) {
+			uint16_t val = CONTAINER_OF(attr->uuid,
+				const struct bt_uuid_16, uuid)->val;
+			if (val == 0x2800) tag = "[SVC-PRIMARY]";
+			else if (val == 0x2801) tag = "[SVC-SECONDARY]";
+			else if (val == 0x2803) tag = "[CHRC-DECL]";
+			else if (val == 0x2902) tag = "[CCC]";
+		}
+		CDC_LOG("  %s %s handle=0x%04x", tag, uuid_str, attr->handle);
 	}
-	LOG_INF("--- End of attributes ---");
+
+	/* 收集所有可读特征值句柄 */
+	g_read_cnt = 0;
+	attr = NULL;
+	while ((attr = bt_gatt_dm_attr_next(dm, attr)) != NULL && g_read_cnt < 32) {
+		if (attr->uuid->type == BT_UUID_TYPE_16 &&
+		    CONTAINER_OF(attr->uuid, const struct bt_uuid_16, uuid)->val == BT_UUID_GATT_CHRC_VAL) {
+			struct bt_gatt_chrc *cv = bt_gatt_dm_attr_chrc_val(attr);
+			if (cv->properties & BT_GATT_CHRC_READ) {
+				g_read_queue[g_read_cnt++] = attr->handle + 1;
+			}
+		}
+	}
+
+	CDC_LOG("=== End of GATT discovery ===");
+}
+
+static uint8_t hid_info_read_cb(struct bt_conn *conn, uint8_t err,
+				struct bt_gatt_read_params *params,
+				const void *data, uint16_t length)
+{
+	if (!err && data && length >= 4) {
+		const uint8_t *d = data;
+		uint16_t bcd = d[0] | ((uint16_t)d[1] << 8);
+		CDC_LOG("HID Info value: bcdHID=%x.%02x country=%u flags=0x%02x",
+			bcd >> 8, bcd & 0xFF, d[2], d[3]);
+		CDC_LOG("  country=0 means Not Localized, flags: "
+			"bit0=RemoteWake bit1=NormallyConnectable");
+	}
+	return BT_GATT_ITER_STOP;
 }
 
 /* 通过 WWoR 写入 CCC 并调用 bt_gatt_resubscribe 订阅
@@ -1031,6 +1234,48 @@ static void subscribe_char_via_wwor(uint16_t value_handle, uint16_t ccc_handle,
 		mouse_subscribed = true;
 		LOG_INF("  Subscribed to %s (WWoR + resubscribe)", desc);
 	}
+}
+
+/* 前置声明 */
+extern const struct bt_gatt_dm_cb dm_cb;
+
+/* 全量 GATT 发现回调: 遍历所有属性并打印 */
+static uint8_t full_gatt_discover_cb(struct bt_conn *conn,
+				     const struct bt_gatt_attr *attr,
+				     struct bt_gatt_discover_params *params)
+{
+	if (!attr) {
+		CDC_LOG("=== Full GATT complete, now HID discovery ===");
+		/* 全量遍历完成，启动 HID 发现+订阅 */
+		bt_gatt_dm_start(conn, BT_UUID_HIDS, &dm_cb, NULL);
+		return BT_GATT_ITER_STOP;
+	}
+	char uuid_str[BT_UUID_STR_LEN];
+	bt_uuid_to_str(attr->uuid, uuid_str, sizeof(uuid_str));
+	const char *tag = "";
+	if (attr->uuid->type == BT_UUID_TYPE_16) {
+		uint16_t v = ((struct bt_uuid_16 *)attr->uuid)->val;
+		if (v == 0x2800) tag = "[SVC-PRIMARY]";
+		else if (v == 0x2801) tag = "[SVC-SECONDARY]";
+		else if (v == 0x2803) tag = "[CHRC]";
+		else if (v == 0x2902) tag = "[CCC]";
+	}
+	CDC_LOG("  %s %s handle=0x%04x", tag, uuid_str, attr->handle);
+	return BT_GATT_ITER_CONTINUE;
+}
+
+/* 遍历所有 Primary Service 的回调 */
+static uint8_t all_services_cb(struct bt_conn *conn,
+			       const struct bt_gatt_attr *attr,
+			       struct bt_gatt_discover_params *params)
+{
+	if (!attr) {
+		CDC_LOG("=== All primary services listed ===");
+		return BT_GATT_ITER_STOP;
+	}
+	/* attr->uuid 是 0x2800(声明类型)，真正服务UUID在handle+1的值里 */
+	CDC_LOG("[SVC] handle=0x%04x (uuid at handle+1, need read)", attr->handle);
+	return BT_GATT_ITER_CONTINUE;
 }
 
 static void discovery_completed(struct bt_gatt_dm *dm, void *context)
@@ -1142,19 +1387,76 @@ static void discovery_completed(struct bt_gatt_dm *dm, void *context)
 		* 使鼠标开始发送 HID 报告
 		*/
 	if (control_point_handle) {
-		uint8_t cp_value = 0x01; /* Exit Suspend */
-		LOG_INF("Writing Control Point (0x2A4C) Exit Suspend=0x%02x "
-			"via WWoR...", cp_value);
+		uint8_t cp_value = 0x01;
+		CDC_LOG("Writing Control Point (0x2A4C) Exit Suspend=0x%02x via WWoR...", cp_value);
 		int err = bt_gatt_write_without_response(ble_conn,
 					control_point_handle,
 					&cp_value, sizeof(cp_value), false);
 		if (err) {
-			LOG_ERR("  Control Point WWoR failed: %d", err);
+			CDC_ERR("Control Point WWoR failed: %d", err);
 		} else {
-			LOG_INF("  Control Point Exit Suspend queued");
+			CDC_LOG("Control Point Exit Suspend queued");
 		}
 	} else {
-		LOG_INF("No Control Point found, skip");
+		CDC_LOG("No Control Point found, skip");
+	}
+
+
+	/* Boot Keyboard Input Report (0x2A22):*/
+	{
+		const struct bt_gatt_dm_attr *a;
+		a = bt_gatt_dm_char_by_uuid(dm, BT_UUID_HIDS_BOOT_KB_IN_REPORT);
+		if (a) {
+			uint16_t vh = bt_gatt_dm_attr_chrc_val(a)->value_handle;
+			CDC_LOG("Boot KB Input (0x2A22) FOUND: value_handle=0x%04x", vh);
+			const struct bt_gatt_dm_attr *ccc =
+				bt_gatt_dm_desc_by_uuid(dm, a, BT_UUID_GATT_CCC);
+			if (ccc) CDC_LOG("  CCC handle=0x%04x", ccc->handle);
+		} else {
+			CDC_LOG("Boot KB Input (0x2A22) NOT FOUND");
+		}
+	}
+
+	/* Boot Keyboard Output Report (0x2A32):  LED */
+	{
+		const struct bt_gatt_dm_attr *a;
+		a = bt_gatt_dm_char_by_uuid(dm, BT_UUID_HIDS_BOOT_KB_OUT_REPORT);
+		if (a) {
+			uint16_t vh = bt_gatt_dm_attr_chrc_val(a)->value_handle;
+			CDC_LOG("Boot KB Output (0x2A32) FOUND: value_handle=0x%04x", vh);
+		} else {
+			CDC_LOG("Boot KB Output (0x2A32) NOT FOUND");
+		}
+	}
+
+	/* Protocol Mode (0x2A4E): 0=Boot, 1=Report */
+	{
+		const struct bt_gatt_dm_attr *a;
+		a = bt_gatt_dm_char_by_uuid(dm, BT_UUID_HIDS_PROTOCOL_MODE);
+		if (a) {
+			uint16_t vh = bt_gatt_dm_attr_chrc_val(a)->value_handle;
+			CDC_LOG("Protocol Mode (0x2A4E) FOUND: value_handle=0x%04x", vh);
+		} else {
+			CDC_LOG("Protocol Mode (0x2A4E) NOT FOUND");
+		}
+	}
+
+	/* HID Information (0x2A4A): bcdHID + CountryCode + Flags (4 bytes) */
+	{
+		const struct bt_gatt_dm_attr *a;
+		a = bt_gatt_dm_char_by_uuid(dm, BT_UUID_HIDS_INFO);
+		if (a) {
+			uint16_t vh = bt_gatt_dm_attr_chrc_val(a)->value_handle;
+			CDC_LOG("HID Info (0x2A4A) handle=0x%04x, reading...", vh);
+			static struct bt_gatt_read_params hi_rp;
+			hi_rp.func = hid_info_read_cb;
+			hi_rp.handle_count = 1;
+			hi_rp.single.handle = vh;
+			hi_rp.single.offset = 0;
+			bt_gatt_read(ble_conn, &hi_rp);
+		} else {
+			CDC_LOG("HID Info (0x2A4A) NOT FOUND");
+		}
 	}
 
 	/* ---- 第4步：读取 HID Report Map (0x2A4B) ----
@@ -1189,14 +1491,22 @@ static void discovery_completed(struct bt_gatt_dm *dm, void *context)
 	/* 释放发现数据 */
 	bt_gatt_dm_data_release(dm);
 
-	/* 启动连接状态监测 */
+	/* 延迟启动串行读取: 500ms后逐个读所有可读特征值，读完再查Service */
+	{
+		static struct k_work_delayable serial_read_work;
+		if (g_read_cnt > 0 && !g_serial_read_done) {
+			g_serial_read_done = true;
+			k_work_init_delayable(&serial_read_work, serial_read_start);
+			k_work_schedule(&serial_read_work, K_MSEC(500));
+		}
+	}
+
 	k_work_schedule(&conn_status_work, K_SECONDS(5));
 }
 
 static void discovery_service_not_found(struct bt_conn *conn, void *context)
 {
-	LOG_WRN("HID Service not found on this device, disconnecting...");
-	bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+	LOG_WRN("No GATT services found (unexpected), keeping connection");
 }
 
 static void discovery_error(struct bt_conn *conn, int err, void *context)
@@ -1206,7 +1516,7 @@ static void discovery_error(struct bt_conn *conn, int err, void *context)
 }
 
 /* GATT DM 回调结构体 */
-static const struct bt_gatt_dm_cb dm_cb = {
+const struct bt_gatt_dm_cb dm_cb = {
 	.completed = discovery_completed,
 	.service_not_found = discovery_service_not_found,
 	.error_found = discovery_error,
@@ -1285,14 +1595,14 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
 	if (err) {
-		printk("=== Security: %s, level %u, FAILED: err %d %s ===\n",
+		LOG_ERR("Security: %s, level %u, FAILED: err %d %s",
 		       addr, level, err, bt_security_err_to_str(err));
 	} else {
-		printk("=== Security changed: %s, level %u ===\n", addr, level);
+		LOG_INF("Security changed: %s, level %u", addr, level);
 	}
 
-	/* 无论安全是否成功，都尝试 GATT 发现（同 central_hids 官方做法） */
-	printk("=== Starting GATT discovery ===\n");
+	/* 启动 HID 发现+订阅 */
+	LOG_INF("Starting GATT discovery");
 	int ret = bt_gatt_dm_start(conn, BT_UUID_HIDS, &dm_cb, NULL);
 	if (ret) {
 		LOG_ERR("GATT DM start failed: %d", ret);
@@ -1323,7 +1633,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 		return;
 	}
 
-	printk("=== Connected: %s ===\n", addr);
+	LOG_INF("Connected: %s", addr);
 	control_point_handle = 0;
 
 	/* 停止硬件自动重连（安全清理，可能未启动） */
@@ -1346,14 +1656,14 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 	/* 直接调用 bt_conn_set_security，同 central_hids 官方做法 */
 	int err = bt_conn_set_security(conn, BT_SECURITY_L2);
 	if (err) {
-		printk("=== bt_conn_set_security failed: %d, starting GATT DM directly ===\n",
+		LOG_ERR("bt_conn_set_security failed: %d, starting GATT DM directly",
 		       err);
 		int ret = bt_gatt_dm_start(conn, BT_UUID_HIDS, &dm_cb, NULL);
 		if (ret) {
 			LOG_ERR("GATT DM start failed: %d", ret);
 		}
 	} else {
-		printk("=== bt_conn_set_security OK, waiting for security_changed ===\n");
+		LOG_INF("bt_conn_set_security OK, waiting for security_changed");
 	}
 }
 
@@ -1372,6 +1682,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	bt_conn_unref(ble_conn);
 	ble_conn = NULL;
 	mouse_subscribed = false;
+	g_serial_read_done = false;  /* 重连后重新读值 */
 
 	/* 取消所有定时器 */
 	k_work_cancel_delayable(&conn_status_work);
@@ -1412,18 +1723,11 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	 * Phase 1 (0-3.5s): mouse_bond_addr_valid=true 精确匹配（同设备槽快速重连）
 	 * Phase 2 (3.5s后): auto_connect_timeout_handler 清除验证，MAC前缀匹配任何 M720
 	 */
-	if (mouse_bond_addr_valid) {
-		LOG_INF("Disconnected, restarting BLE scan in 500ms (bond filter, 3.5s timeout)...");
-		cdc_acm_print("CDC: Disconnected, bond filter 3.5s timeout\r\n");
-		k_work_schedule(&scan_timeout_work, K_MSEC(500));
-		/* 3.5s = 0.5s(HCI释放) + 3s(bond筛选)，确保扫描开始后有完整的3秒 Phase 1 */
-		k_work_schedule(&auto_connect_timeout_work, K_SECONDS(4));
-	} else {
-		/* 第一次使用，没有绑定，回退到普通扫描 */
-		LOG_INF("No bonded device, restarting BLE scan in 500ms...");
-		cdc_acm_print("CDC: Disconnected, no bond, scanning\r\n");
-		k_work_schedule(&scan_timeout_work, K_MSEC(500));
-	}
+	/* 优先硬件自动重连（Accept List），失败或超时回退软件扫描 */
+	LOG_INF("Disconnected, trying hardware auto reconnect in 500ms...");
+	cdc_acm_print("CDC: Disconnected, auto reconnect...\r\n");
+	k_work_schedule(&delayed_auto_connect_work, K_MSEC(500));
+	k_work_schedule(&auto_connect_timeout_work, K_SECONDS(15));
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -1487,7 +1791,7 @@ static void delayed_auto_connect_handler(struct k_work *work)
  */
 
 
-static bool eir_check_hid_mouse(struct bt_data *data, void *user_data)
+static bool eir_check_hid_device(struct bt_data *data, void *user_data)
 {
 	bt_addr_le_t *addr = user_data;
 	int i;
@@ -1510,12 +1814,14 @@ static bool eir_check_hid_mouse(struct bt_data *data, void *user_data)
 		break;
 
 	case BT_DATA_GAP_APPEARANCE:
-		/* 检查 Appearance 是否为鼠标 (0x03C2=962) */
 		if (data->data_len >= sizeof(uint16_t)) {
-			uint16_t appearance;
-			memcpy(&appearance, data->data, sizeof(uint16_t));
-			if (sys_le16_to_cpu(appearance) == BT_APPEARANCE_HID_MOUSE) {
-				LOG_INF("Mouse appearance found, connecting...");
+			uint16_t appearance = sys_le16_to_cpu(*(uint16_t *)data->data);
+			if (appearance == BT_APPEARANCE_HID_MOUSE) {
+				LOG_INF("Mouse appearance (0x%04x), connecting...", appearance);
+				goto do_connect;
+			}
+			if (appearance == BT_APPEARANCE_HID_KEYBOARD) {
+				LOG_INF("Keyboard appearance (0x%04x), connecting...", appearance);
 				goto do_connect;
 			}
 		}
@@ -1541,12 +1847,6 @@ do_connect:
 	return false;
 }
 
-/* M720 的 MAC 前缀（BT 地址存储为小端序，val[0]=最低字节）
- * MAC 字符串: FB:DE:BD:46:FF:0C
- * val[]     : { 0x0C, 0xFF, 0x46, 0xBD, 0xDE, 0xFB }
- * 前5字节前缀: FB:DE:BD:46:FF 对应 val[5..1]
- */
-static const uint8_t target_mac_prefix[5] = { 0xFF, 0x46, 0xBD, 0xDE, 0xFB };
 
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad)
@@ -1597,26 +1897,10 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	 * 注意：如果鼠标切换到了新设备槽（配对模式），auto_connect 超时后会
 	 * 清除 mouse_bond_addr_valid，允许扫描连接到任何 M720。
 	 */
-	if (mouse_bond_addr_valid) {
-		/* 只连接已绑定的精确地址 */
-		if (bt_addr_le_cmp(addr, &mouse_bond_addr) == 0) {
-			LOG_INF("*** Bonded device found: %s! ***", dev);
-			cdc_acm_print("CDC: Bonded device found, connecting...\r\n");
-			bt_data_parse(ad, eir_check_hid_mouse, (void *)addr);
-		} else {
-			cdc_acm_print("CDC: Skip (addr mismatch, waiting timeout)\r\n");
-			LOG_INF("Skip %s (addr not match bonded, waiting for auto-connect timeout)", dev);
-		}
-	} else {
-		/* 首次连接或 auto-connect 已超时：使用 MAC 前缀匹配发现 M720 */
-		if (memcmp(&addr->a.val[1], target_mac_prefix, 5) == 0) {
-			LOG_INF("*** MAC prefix matched %s! Checking EIR data... ***", dev);
-			cdc_acm_print("CDC: MAC matched, checking HID service...\r\n");
-			bt_data_parse(ad, eir_check_hid_mouse, (void *)addr);
-		} else {
-			LOG_DBG("MAC prefix mismatch");
-		}
-	}
+	/* RSSI达标+可连接 -> 直接检查HID, 不限MAC */
+	LOG_INF("Checking HID service for %s...", dev);
+	cdc_acm_print("CDC: RSSI ok, checking HID...\r\n");
+	bt_data_parse(ad, eir_check_hid_device, (void *)addr);
 }
 
 static void start_ble_scan(void)
@@ -1631,8 +1915,8 @@ static void start_ble_scan(void)
 	struct bt_le_scan_param scan_param = {
 		.type       = BT_LE_SCAN_TYPE_ACTIVE,
 		.options    = BT_LE_SCAN_OPT_NONE,
-		.interval   = BT_GAP_SCAN_FAST_INTERVAL,
-		.window     = BT_GAP_SCAN_FAST_WINDOW,
+		.interval   = 0x0640,   /* 1000ms (0x0640 * 0.625ms) */
+		.window     = 0x00A0,   /*  100ms (0x00A0 * 0.625ms) */
 	};
 
 	err = bt_le_scan_start(&scan_param, device_found);
@@ -1845,61 +2129,27 @@ int main(void)
 
 	/* ---- 第8步：主循环，处理鼠标和键盘事件 ---- */
 	/* CDC ACM 心跳计时器（每5秒输出一次，验证 COM 口是否工作） */
-	uint32_t cdc_acm_last_tick = 0;
-
 	while (true) {
-		/* CDC ACM 心跳输出（来自线程上下文，和 hid-keyboard 的 auto_type_task 模式一致）
-		 * 注意：不在 usbd_msg_cb() 回调中调用 CDC ACM，而是从主循环线程输出。
-		 */
-		uint32_t now = k_uptime_get_32();
-		if (now - cdc_acm_last_tick > 5000) {
-			cdc_acm_print("BLE-to-USB HID bridge running...\r\n");
-			cdc_acm_last_tick = now;
-		}
-		bool has_data = false;
-
-		/* 检查鼠标事件 */
 		UDC_STATIC_BUF_DEFINE(mouse_report, MOUSE_REPORT_COUNT);
-		if (k_msgq_get(&mouse_msgq, &mouse_report, K_NO_WAIT) == 0) {
-			if (mouse_ready) {
-				ret = hid_device_submit_report(mouse_dev,
-					MOUSE_REPORT_COUNT, mouse_report);
-				if (ret) {
-					LOG_ERR("USB submit error: %d", ret);
-				} else {
-					LOG_DBG("USB report sent: "
-						"[0x%02x %d %d %d]",
-						mouse_report[MOUSE_BTN_REPORT_IDX],
-						(int8_t)mouse_report[MOUSE_X_REPORT_IDX],
-						(int8_t)mouse_report[MOUSE_Y_REPORT_IDX],
-						(int8_t)mouse_report[MOUSE_WHEEL_REPORT_IDX]);
-				}
-			} else {
-				LOG_DBG("Mouse USB not ready, drop report");
+		k_msgq_get(&mouse_msgq, &mouse_report, K_FOREVER);
+		if (mouse_ready) {
+			ret = hid_device_submit_report(mouse_dev,
+				MOUSE_REPORT_COUNT, mouse_report);
+			if (ret) {
+				LOG_ERR("USB submit error: %d", ret);
 			}
-			has_data = true;
 		}
 
 		/* 检查键盘事件 */
 		UDC_STATIC_BUF_DEFINE(kb_report, KB_REPORT_COUNT);
-		if (k_msgq_get(&kb_msgq, &kb_report, K_NO_WAIT) == 0) {
+		while (k_msgq_get(&kb_msgq, &kb_report, K_NO_WAIT) == 0) {
 			if (kb_ready) {
 				ret = hid_device_submit_report(kb_dev,
 					KB_REPORT_COUNT, kb_report);
 				if (ret) {
 					LOG_ERR("KB report error, %d", ret);
 				}
-			} else {
-				LOG_DBG("KB USB not ready, drop report");
 			}
-			has_data = true;
-		}
-
-		/* 如果没有数据，等10ms再检查 */
-		if (!has_data) {
-			k_msleep(10);
 		}
 	}
-
-	return 0;
 }
