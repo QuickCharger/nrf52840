@@ -48,7 +48,12 @@ static const struct device *cdc_acm_dev;
 
 static void cdc_acm_print(const char *str)
 {
-	if (!cdc_acm_dev || !device_is_ready(cdc_acm_dev)) {
+	if (!cdc_acm_dev) {
+		return;
+	}
+
+	if (!device_is_ready(cdc_acm_dev)) {
+		LOG_WRN("CDC ACM device not ready, cannot print: %s", str);
 		return;
 	}
 
@@ -71,7 +76,8 @@ static void cdc_acm_print(const char *str)
 /* ============================================================
  *  鼠标相关 (USB HID)
  * ============================================================ */
-static const uint8_t hid_mouse_report_desc[] = HID_MOUSE_REPORT_DESC(2);
+/* M720 有 5 个按键: 左键(1)、右键(2)、中键(3)、后退(4)、前进(5) */
+static const uint8_t hid_mouse_report_desc[] = HID_MOUSE_REPORT_DESC(5);
 
 /* USB HID Mouse Report 格式: [按钮, X(int8), Y(int8), 滚轮(int8)] */
 enum mouse_report_idx {
@@ -113,7 +119,8 @@ static void unpack_mouse_report_7byte(const uint8_t *data,
 				      uint8_t *report)
 {
 	/* 7 字节报告布局 (HID Report ID 2):
-	 *   data[0] = buttons byte 0 (bit0=左键, bit1=右键, bit2=中键)
+	 *   data[0] = buttons byte 0 (bit0=左键, bit1=右键, bit2=中键,
+	 *                                bit3=后退, bit4=前进)
 	 *   data[1] = buttons byte 1 (保留)
 	 *   data[2] = X[7:0]       (低 8 位)
 	 *   data[3] = X[11:8] | Y[3:0]<<4  (X 高 4 位 + Y 低 4 位)
@@ -140,8 +147,8 @@ static void unpack_mouse_report_7byte(const uint8_t *data,
 	if (y_val > 127) y_val = 127;
 	if (y_val < -127) y_val = -127;
 
-	/* 按钮: data[0] 低 3 位 = 左键/右键/中键 */
-	report[MOUSE_BTN_REPORT_IDX] = data[0] & 0x07;
+	/* 按钮: data[0] 低 5 位 = 左键/右键/中键/后退/前进 */
+	report[MOUSE_BTN_REPORT_IDX] = data[0] & 0x1F;
 	report[MOUSE_X_REPORT_IDX] = (uint8_t)x_val;
 	report[MOUSE_Y_REPORT_IDX] = (uint8_t)y_val;
 
@@ -213,6 +220,23 @@ static void ble_mouse_report_forward(const uint8_t *data, uint16_t len)
 		(int8_t)report[MOUSE_X_REPORT_IDX],
 		(int8_t)report[MOUSE_Y_REPORT_IDX],
 		(int8_t)report[MOUSE_WHEEL_REPORT_IDX]);
+
+	/* 通过 CDC ACM 输出按钮事件（方便观察哪些按钮被按下） */
+	if (data[0] != 0) {
+		/* 只在有按钮按下时输出 */
+		char buf[64];
+		int n = snprintf(buf, sizeof(buf),
+			"BTN: raw=0x%02x L=%d R=%d M=%d B4=%d F5=%d\r\n",
+			data[0],
+			(data[0] >> 0) & 1,  /* Left   */
+			(data[0] >> 1) & 1,  /* Right  */
+			(data[0] >> 2) & 1,  /* Middle */
+			(data[0] >> 3) & 1,  /* Back   */
+			(data[0] >> 4) & 1); /* Forward */
+		if (n > 0 && n < (int)sizeof(buf)) {
+			cdc_acm_print(buf);
+		}
+	}
 
 	if (k_msgq_put(&mouse_msgq, report, K_NO_WAIT) != 0) {
 		LOG_DBG("Mouse msgq full, dropping report");
@@ -1587,21 +1611,31 @@ static void start_ble_scan(void)
 static void usbd_msg_cb(struct usbd_context *const usbd_ctx,
 			const struct usbd_msg *const msg)
 {
-	LOG_INF("USBD message: %s", usbd_msg_type_string(msg->type));
+	LOG_INF("USBD message: %s (status=%d)", usbd_msg_type_string(msg->type),
+		msg->status);
 
 	if (msg->type == USBD_MSG_CONFIGURATION) {
-		LOG_INF("\tConfiguration value %d", msg->status);
+		LOG_INF("*** USB CONFIGURED (config=%d) ***", msg->status);
+		LOG_INF("CDC ACM dev ready=%d",
+			cdc_acm_dev ? device_is_ready(cdc_acm_dev) : -1);
+		/* 注意：不在此回调中调用 cdc_acm_print()！
+		 * hid-keyboard 参考示例的做法是：从线程（而非回调）中输出 CDC ACM。
+		 * 在回调中输出可能导致数据写入 ring buffer 后无法正确刷新。
+		 */
 	}
 
+	/* VBUS 检测 */
 	if (usbd_can_detect_vbus(usbd_ctx)) {
 		if (msg->type == USBD_MSG_VBUS_READY) {
+			LOG_INF("VBUS ready, enabling USB...");
 			int ret = usbd_enable(usbd_ctx);
 			if (ret) {
-				LOG_ERR("Failed to enable USB device support");
+				LOG_ERR("Failed to enable USB device support: %d", ret);
 			}
 		}
 
 		if (msg->type == USBD_MSG_VBUS_REMOVED) {
+			LOG_INF("VBUS removed");
 			if (usbd_disable(usbd_ctx)) {
 				LOG_ERR("Failed to disable USB device support");
 			}
@@ -1687,13 +1721,13 @@ int main(void)
 	LOG_DBG("USB initialized");
 
 	/* ---- 第5步：初始化 CDC ACM 虚拟 COM 端口 ---- */
+	/* 注意：不检查 device_is_ready()，也不立即打印。
+	 * CDC ACM 设备在 PRE_KERNEL_1 阶段初始化，始终返回 ready。
+	 * 但 USB 枚举需要时间，过早输出的数据虽然会缓冲，
+	 * 等 USB 配置完成后由 usbd_cdc_acm_enable() 自动刷新。
+	 * 参考 hid-keyboard 示例的做法。
+	 */
 	cdc_acm_dev = DEVICE_DT_GET(DT_NODELABEL(cdc_acm_uart0));
-	if (device_is_ready(cdc_acm_dev)) {
-		cdc_acm_print("CDC ACM virtual COM port ready\r\n");
-		LOG_INF("CDC ACM UART initialized");
-	} else {
-		LOG_DBG("CDC ACM UART not available");
-	}
 
 #if 0
 	/* ---- 第6步：创建键盘自动打字任务（调试用，暂时关闭） ---- */
@@ -1770,7 +1804,18 @@ int main(void)
 	}
 
 	/* ---- 第8步：主循环，处理鼠标和键盘事件 ---- */
+	/* CDC ACM 心跳计时器（每5秒输出一次，验证 COM 口是否工作） */
+	uint32_t cdc_acm_last_tick = 0;
+
 	while (true) {
+		/* CDC ACM 心跳输出（来自线程上下文，和 hid-keyboard 的 auto_type_task 模式一致）
+		 * 注意：不在 usbd_msg_cb() 回调中调用 CDC ACM，而是从主循环线程输出。
+		 */
+		uint32_t now = k_uptime_get_32();
+		if (now - cdc_acm_last_tick > 5000) {
+			cdc_acm_print("BLE-to-USB HID bridge running...\r\n");
+			cdc_acm_last_tick = now;
+		}
 		bool has_data = false;
 
 		/* 检查鼠标事件 */
