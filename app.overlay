@@ -20,4 +20,17 @@
 		in-polling-period-us = <1000>;
 		in-report-size = <64>;
 	};
+
+	/* hid_dev_2: WebHID 配置接口
+	 * 用于通过浏览器 WebHID API 读取/保存设备配置参数。
+	 * 使用 Vendor-Defined HID Report Descriptor，
+	 * 通过 Feature 报告实现双向数据交换。
+	 */
+	hid_dev_2: hid_dev_2 {
+		compatible = "zephyr,hid-device";
+		label = "HID2";
+		protocol-code = "none";
+		in-polling-period-us = <1000>;
+		in-report-size = <64>;
+	};
 };

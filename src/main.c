@@ -38,10 +38,11 @@
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 /* ============================================================
- *  RSSI 阈值：信号强度 >= -70 dBm 时尝试连接
- *  初始调试阶段可降低到 -90，生产环境建议 -60
+ *  RSSI 阈值：信号强度 >= 此值时尝试连接
+ *  -30 dBm = 紧贴设备, -55 dBm ≈ 1米, -70 dBm ≈ 5-10米
+ *  设为 -55 只扫描 1 米以内的设备
  * ============================================================ */
-#define BLE_HID_RSSI_THRESHOLD  (-90)
+#define BLE_HID_RSSI_THRESHOLD  (-55)
 
 /* 调试阶段：直接指定鼠标 MAC 地址 */
 #define BLE_MOUSE_TARGET_MAC   "FB:DE:BD:46:FF:0B"
@@ -282,6 +283,483 @@ struct hid_device_ops kb_ops = {
 };
 
 /* ============================================================
+ *  WebHID 配置接口 (hid_dev_2)
+ *
+ *  通过 USB HID Feature 报告实现浏览器 WebHID API 通信，
+ *  用于读取/保存设备配置参数。
+ *
+ *  协议格式 (64 字节 Feature Report, Report ID 1):
+ *
+ *   主机 → 设备 (Set_Report):
+ *     [0]  = Report ID (0x01)
+ *     [1]  = 命令 (CMD_xxx)
+ *     [2]  = 参数 ID
+ *     [3]  = 数据长度 (仅 WRITE_PARAM)
+ *     [4..63] = 数据 (仅 WRITE_PARAM)
+ *
+ *   设备 → 主机 (Get_Report):
+ *     [0]  = Report ID (0x01)
+ *     [1]  = 状态 (STATUS_xxx)
+ *     [2]  = 参数 ID (回显)
+ *     [3]  = 数据长度
+ *     [4..63] = 数据
+ *
+ *  使用 Zephyr settings 子系统持久化保存参数到 Flash。
+ * ============================================================ */
+
+/* ---- 命令定义 ---- */
+#define CFG_CMD_PING           0x01  /* 测试连接，设备回复 PONG */
+#define CFG_CMD_READ_PARAM     0x02  /* 读取参数值 */
+#define CFG_CMD_WRITE_PARAM    0x03  /* 写入参数值 */
+#define CFG_CMD_SAVE_ALL       0x04  /* 保存所有参数到 Flash */
+#define CFG_CMD_LOAD_ALL       0x05  /* 从 Flash 重新加载所有参数 */
+#define CFG_CMD_LIST_PARAMS    0x06  /* 列出所有可用的参数 ID */
+
+/* ---- 状态码 ---- */
+#define CFG_STATUS_OK               0x00
+#define CFG_STATUS_BUSY             0x01
+#define CFG_STATUS_UNKNOWN_CMD      0x02
+#define CFG_STATUS_INVALID_PARAM    0x03
+#define CFG_STATUS_INVALID_LEN      0x04
+#define CFG_STATUS_ERROR            0xFF
+
+/* ---- 参数 ID 定义 ---- */
+#define CFG_PARAM_RSSI_THRESHOLD  1  /* int8_t, 范围 -127~0, 默认 -90 */
+#define CFG_PARAM_AUTO_RECONNECT  2  /* uint8_t, 0/1, 默认 1 */
+#define CFG_PARAM_MOUSE_SPEED     3  /* uint8_t, 1~10, 默认 5 */
+#define CFG_PARAM_DEMO_INT        4  /* int32_t, 演示用整数参数 */
+#define CFG_PARAM_DEMO_STRING     5  /* char[16], 演示用字符串参数 */
+
+#define CFG_PARAM_COUNT           5
+#define CFG_REPORT_SIZE           64
+#define CFG_REPORT_ID             1
+
+/* ---- 参数名称表（用于 LIST_PARAMS 响应） ---- */
+struct cfg_param_info {
+	uint8_t id;
+	uint8_t size;   /* 参数数据大小（字节） */
+	const char *name;
+};
+
+static const struct cfg_param_info cfg_params[] = {
+	{ CFG_PARAM_RSSI_THRESHOLD, 1, "rssi_threshold" },
+	{ CFG_PARAM_AUTO_RECONNECT, 1, "auto_reconnect" },
+	{ CFG_PARAM_MOUSE_SPEED,    1, "mouse_speed" },
+	{ CFG_PARAM_DEMO_INT,       4, "demo_int" },
+	{ CFG_PARAM_DEMO_STRING,   16, "demo_string" },
+};
+
+/* ---- 参数存储（运行时值） ---- */
+static struct {
+	int8_t  rssi_threshold;
+	uint8_t auto_reconnect;
+	uint8_t mouse_speed;
+	int32_t demo_int;
+	char    demo_string[16];
+} cfg_data = {
+	.rssi_threshold = -90,
+	.auto_reconnect = 1,
+	.mouse_speed    = 5,
+	.demo_int       = 12345,
+	.demo_string    = "Hello WebHID",
+};
+
+/* ---- 打印所有参数当前值 ---- */
+static void cfg_dump_values(void)
+{
+	LOG_INF("=== CFG Parameter Dump ===");
+	LOG_INF("  rssi_threshold = %d (int8)", cfg_data.rssi_threshold);
+	LOG_INF("  auto_reconnect = %u (uint8)", cfg_data.auto_reconnect);
+	LOG_INF("  mouse_speed    = %u (uint8)", cfg_data.mouse_speed);
+	LOG_INF("  demo_int       = %d (int32)", cfg_data.demo_int);
+	LOG_INF("  demo_string    = '%s' (char[16])", cfg_data.demo_string);
+	LOG_INF("=== End of Dump ===");
+}
+
+/* ---- 配置状态 ---- */
+static bool cfg_ready;
+/* 用于 Get_Report 响应的缓冲区（USB 栈线程上下文无法阻塞） */
+static uint8_t cfg_response_buf[CFG_REPORT_SIZE];
+/* 标记是否有待读取的响应数据 */
+static bool cfg_response_pending;
+
+/* ---- 通过参数 ID 获取参数值和大小 ---- */
+static int cfg_get_value(uint8_t param_id, uint8_t *out_buf, uint8_t buf_size)
+{
+	switch (param_id) {
+	case CFG_PARAM_RSSI_THRESHOLD:
+		if (buf_size < 1) return -ENOBUFS;
+		out_buf[0] = (uint8_t)(cfg_data.rssi_threshold);
+		return 1;
+	case CFG_PARAM_AUTO_RECONNECT:
+		if (buf_size < 1) return -ENOBUFS;
+		out_buf[0] = cfg_data.auto_reconnect;
+		return 1;
+	case CFG_PARAM_MOUSE_SPEED:
+		if (buf_size < 1) return -ENOBUFS;
+		out_buf[0] = cfg_data.mouse_speed;
+		return 1;
+	case CFG_PARAM_DEMO_INT:
+		if (buf_size < 4) return -ENOBUFS;
+		sys_put_le32(cfg_data.demo_int, out_buf);
+		return 4;
+	case CFG_PARAM_DEMO_STRING:
+	{
+		size_t len = strlen(cfg_data.demo_string);
+		if (len > buf_size) len = buf_size;
+		memcpy(out_buf, cfg_data.demo_string, len);
+		return len;
+	}
+	default:
+		return -EINVAL;
+	}
+}
+
+/* ---- 通过参数 ID 设置参数值 ---- */
+static int cfg_set_value(uint8_t param_id, const uint8_t *data, uint8_t len)
+{
+	switch (param_id) {
+	case CFG_PARAM_RSSI_THRESHOLD:
+		if (len < 1) return -EINVAL;
+		cfg_data.rssi_threshold = (int8_t)data[0];
+		LOG_INF("CFG: rssi_threshold set to %d", cfg_data.rssi_threshold);
+		return 0;
+	case CFG_PARAM_AUTO_RECONNECT:
+		if (len < 1) return -EINVAL;
+		cfg_data.auto_reconnect = data[0] ? 1 : 0;
+		LOG_INF("CFG: auto_reconnect set to %u", cfg_data.auto_reconnect);
+		return 0;
+	case CFG_PARAM_MOUSE_SPEED:
+		if (len < 1) return -EINVAL;
+		cfg_data.mouse_speed = CLAMP(data[0], 1, 10);
+		LOG_INF("CFG: mouse_speed set to %u", cfg_data.mouse_speed);
+		return 0;
+	case CFG_PARAM_DEMO_INT:
+		if (len < 4) return -EINVAL;
+		cfg_data.demo_int = (int32_t)sys_get_le32(data);
+		LOG_INF("CFG: demo_int set to %d", cfg_data.demo_int);
+		return 0;
+	case CFG_PARAM_DEMO_STRING:
+	{
+		size_t copy_len = MIN(len, sizeof(cfg_data.demo_string) - 1);
+		memcpy(cfg_data.demo_string, data, copy_len);
+		cfg_data.demo_string[copy_len] = '\0';
+		LOG_INF("CFG: demo_string set to '%s'", cfg_data.demo_string);
+		return 0;
+	}
+	default:
+		return -EINVAL;
+	}
+}
+
+/* ---- Settings 回调：从 Flash 加载参数 ---- */
+static int cfg_settings_set(const char *key, size_t len,
+			    settings_read_cb read_cb, void *cb_arg)
+{
+	if (!key) {
+		return 0;
+	}
+
+	if (strcmp(key, "rssi_threshold") == 0) {
+		if (len != sizeof(cfg_data.rssi_threshold)) return 0;
+		read_cb(cb_arg, &cfg_data.rssi_threshold, len);
+	} else if (strcmp(key, "auto_reconnect") == 0) {
+		if (len != sizeof(cfg_data.auto_reconnect)) return 0;
+		read_cb(cb_arg, &cfg_data.auto_reconnect, len);
+	} else if (strcmp(key, "mouse_speed") == 0) {
+		if (len != sizeof(cfg_data.mouse_speed)) return 0;
+		read_cb(cb_arg, &cfg_data.mouse_speed, len);
+	} else if (strcmp(key, "demo_int") == 0) {
+		if (len != sizeof(cfg_data.demo_int)) return 0;
+		read_cb(cb_arg, &cfg_data.demo_int, len);
+	} else if (strcmp(key, "demo_string") == 0) {
+		size_t str_len = MIN(len, sizeof(cfg_data.demo_string) - 1);
+		read_cb(cb_arg, cfg_data.demo_string, str_len);
+		cfg_data.demo_string[str_len] = '\0';
+	}
+
+	return 0;
+}
+
+/* 注册 settings 处理器 */
+SETTINGS_STATIC_HANDLER_DEFINE(cfg, "cfg", NULL, cfg_settings_set, NULL, NULL);
+
+/* ---- 保存单个参数到 Flash ---- */
+static int cfg_save_param(uint8_t param_id)
+{
+	const char *key = NULL;
+	const void *data = NULL;
+	size_t size = 0;
+
+	switch (param_id) {
+	case CFG_PARAM_RSSI_THRESHOLD:
+		key = "cfg/rssi_threshold";
+		data = &cfg_data.rssi_threshold;
+		size = sizeof(cfg_data.rssi_threshold);
+		break;
+	case CFG_PARAM_AUTO_RECONNECT:
+		key = "cfg/auto_reconnect";
+		data = &cfg_data.auto_reconnect;
+		size = sizeof(cfg_data.auto_reconnect);
+		break;
+	case CFG_PARAM_MOUSE_SPEED:
+		key = "cfg/mouse_speed";
+		data = &cfg_data.mouse_speed;
+		size = sizeof(cfg_data.mouse_speed);
+		break;
+	case CFG_PARAM_DEMO_INT:
+		key = "cfg/demo_int";
+		data = &cfg_data.demo_int;
+		size = sizeof(cfg_data.demo_int);
+		break;
+	case CFG_PARAM_DEMO_STRING:
+		key = "cfg/demo_string";
+		data = cfg_data.demo_string;
+		size = strlen(cfg_data.demo_string) + 1;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	int err = settings_save_one(key, data, size);
+	if (err) {
+		LOG_ERR("CFG: Failed to save %s: %d", key, err);
+	} else {
+		LOG_INF("CFG: Saved %s", key);
+	}
+	return err;
+}
+
+/* ---- 保存所有参数到 Flash ---- */
+static int cfg_save_all(void)
+{
+	LOG_INF("CFG: Saving all %d parameters to flash...", CFG_PARAM_COUNT);
+	cfg_dump_values();
+	for (int i = 0; i < CFG_PARAM_COUNT; i++) {
+		int err = cfg_save_param(cfg_params[i].id);
+		if (err) {
+			LOG_ERR("CFG: Save all FAILED at param #%d: %d", cfg_params[i].id, err);
+			return err;
+		}
+	}
+	LOG_INF("CFG: All parameters saved to flash OK");
+	/* 验证：重新加载并打印 */
+	LOG_INF("CFG: Verifying by reloading from flash...");
+	settings_load_subtree("cfg");
+	cfg_dump_values();
+	return 0;
+}
+
+/* ---- 构建 List Params 响应 ---- */
+static int cfg_build_list_response(uint8_t *buf, uint8_t buf_size)
+{
+	uint8_t pos = 0;
+	for (int i = 0; i < CFG_PARAM_COUNT && pos < buf_size - 4; i++) {
+		/* 格式: [ID(1), Size(1), Name(null-terminated)] */
+		buf[pos++] = cfg_params[i].id;
+		buf[pos++] = cfg_params[i].size;
+		size_t name_len = strlen(cfg_params[i].name);
+		size_t copy = MIN(name_len, buf_size - pos - 1);
+		memcpy(&buf[pos], cfg_params[i].name, copy);
+		pos += copy;
+		buf[pos++] = '\0'; /* null 终止 */
+	}
+	return pos;
+}
+
+/* ---- HID Report Descriptor for WebHIC Config (Vendor-Defined) ---- */
+static const uint8_t hid_config_report_desc[] = {
+	/* Usage Page (Vendor Defined 0xFF00) */
+	0x06, 0x00, 0xFF,       /* Usage Page (Vendor Defined 0xFF00) */
+	0x09, 0x01,             /* Usage (Vendor Usage 1 - Config) */
+	0xA1, 0x01,             /* Collection (Application) */
+
+	/* Report ID 1: Config Feature Report (64 bytes) */
+	0x85, CFG_REPORT_ID,    /*   Report ID (1) */
+	0x09, 0x01,             /*   Usage (Config Data) */
+	0x15, 0x00,             /*   Logical Minimum (0) */
+	0x26, 0xFF, 0x00,       /*   Logical Maximum (255) */
+	0x75, 0x08,             /*   Report Size (8 bits) */
+	0x95, CFG_REPORT_SIZE,  /*   Report Count (64) */
+	0xB1, 0x02,             /*   Feature (Data,Var,Abs) */
+
+	0xC0                    /* End Collection */
+};
+
+/* 配置 HID 就绪回调 */
+static void cfg_iface_ready(const struct device *dev, const bool ready)
+{
+	LOG_INF("Config HID ready: %s", ready ? "yes" : "no");
+	cfg_ready = ready;
+
+	if (ready) {
+		/* 加载配置参数 */
+		if (IS_ENABLED(CONFIG_SETTINGS)) {
+			LOG_INF("CFG: Loading settings from flash...");
+			settings_load_subtree("cfg");
+			cfg_dump_values();
+		}
+	}
+}
+
+/* 配置 HID Get_Report 回调：主机读取 Feature 报告 */
+static int cfg_get_report(const struct device *dev,
+			  const uint8_t type, const uint8_t id,
+			  const uint16_t len, uint8_t *const buf)
+{
+	if (type != HID_REPORT_TYPE_FEATURE || id != CFG_REPORT_ID) {
+		return -EINVAL;
+	}
+
+	/* 检查是否有待发送的响应数据 */
+	if (!cfg_response_pending) {
+		/* 没有待发送的数据，返回空报告 */
+		memset(buf, 0, MIN(len, CFG_REPORT_SIZE));
+		buf[0] = CFG_REPORT_ID;
+		buf[1] = CFG_STATUS_BUSY;
+		return MIN(len, CFG_REPORT_SIZE);
+	}
+
+	uint16_t copy_len = MIN(len, CFG_REPORT_SIZE);
+	memcpy(buf, cfg_response_buf, copy_len);
+	cfg_response_pending = false;
+
+	LOG_DBG("CFG: Get_Report returning %u bytes, status=%02x",
+		copy_len, buf[1]);
+
+	return copy_len;
+}
+
+/* 配置 HID Set_Report 回调：主机发送 Feature 报告（命令）
+ *
+ * USB 数据格式（Chrome WebHID 自动在数据前追加 Report ID）：
+ *   buf[0] = Report ID (0x01)
+ *   buf[1] = 命令 (CMD_xxx)
+ *   buf[2] = 参数 ID
+ *   buf[3] = 数据长度 (仅 WRITE_PARAM)
+ *   buf[4..] = 数据
+ */
+static int cfg_set_report(const struct device *dev,
+			  const uint8_t type, const uint8_t id,
+			  const uint16_t len, const uint8_t *const buf)
+{
+	if (type != HID_REPORT_TYPE_FEATURE || id != CFG_REPORT_ID) {
+		return -EINVAL;
+	}
+
+	/* 打印接收到的原始数据（前16字节）用于调试 */
+	LOG_INF("CFG: Set_Report received: len=%u, type=0x%02x, id=%u", len, type, id);
+	LOG_HEXDUMP_INF(buf, MIN(len, 16), "CFG: Set_Report raw");
+
+	if (len < 2 || buf[0] != CFG_REPORT_ID) {
+		LOG_ERR("CFG: Invalid header: len=%u, buf[0]=0x%02x (expected 0x%02x)",
+			len, buf[0], CFG_REPORT_ID);
+		return -EINVAL;
+	}
+
+	uint8_t cmd = buf[1];
+	uint8_t param_id = (len > 2) ? buf[2] : 0;
+	uint8_t data_len = (len > 3) ? buf[3] : 0;
+	const uint8_t *data = (len > 4) ? &buf[4] : NULL;
+
+	LOG_INF("CFG: Command: cmd=0x%02x, param=%u, data_len=%u", cmd, param_id, data_len);
+
+	/* 构建响应（存入 cfg_response_buf 供 Get_Report 读取） */
+	memset(cfg_response_buf, 0, CFG_REPORT_SIZE);
+	cfg_response_buf[0] = CFG_REPORT_ID;
+	cfg_response_buf[1] = CFG_STATUS_OK;
+
+	switch (cmd) {
+	case CFG_CMD_PING:
+		LOG_INF("CFG: PING command");
+		/* 返回 PONG + 固件版本信息 */
+		cfg_response_buf[2] = 0;
+		cfg_response_buf[3] = 6;
+		memcpy(&cfg_response_buf[4], "PONG!", 5);
+		cfg_response_buf[9] = 0; /* 版本号: 主版本 */
+		cfg_response_buf[10] = 1; /* 次版本 */
+		break;
+
+	case CFG_CMD_READ_PARAM: {
+		LOG_INF("CFG: READ_PARAM #%u", param_id);
+		uint8_t value_buf[CFG_REPORT_SIZE - 4];
+		int ret = cfg_get_value(param_id, value_buf, sizeof(value_buf));
+		if (ret < 0) {
+			LOG_ERR("CFG: READ_PARAM #%u failed: %d", param_id, ret);
+			cfg_response_buf[1] = CFG_STATUS_INVALID_PARAM;
+		} else {
+			cfg_response_buf[2] = param_id;
+			cfg_response_buf[3] = (uint8_t)ret;
+			memcpy(&cfg_response_buf[4], value_buf, ret);
+			LOG_HEXDUMP_INF(value_buf, ret, "CFG: READ_PARAM value");
+		}
+		break;
+	}
+
+	case CFG_CMD_WRITE_PARAM: {
+		if (data == NULL || data_len == 0) {
+			LOG_ERR("CFG: WRITE_PARAM invalid: data=%p, data_len=%u", data, data_len);
+			cfg_response_buf[1] = CFG_STATUS_INVALID_LEN;
+		} else {
+			LOG_HEXDUMP_INF(data, MIN(data_len, 16), "CFG: WRITE_PARAM data");
+			int ret = cfg_set_value(param_id, data, data_len);
+			if (ret < 0) {
+				LOG_ERR("CFG: WRITE_PARAM #%u failed: %d", param_id, ret);
+				cfg_response_buf[1] = CFG_STATUS_INVALID_PARAM;
+			} else {
+				cfg_response_buf[2] = param_id;
+				LOG_INF("CFG: Param #%u updated OK", param_id);
+				cfg_dump_values();
+			}
+		}
+		break;
+	}
+
+	case CFG_CMD_SAVE_ALL: {
+		LOG_INF("CFG: SAVE_ALL command");
+		int ret = cfg_save_all();
+		if (ret < 0) {
+			LOG_ERR("CFG: SAVE_ALL failed: %d", ret);
+			cfg_response_buf[1] = CFG_STATUS_ERROR;
+		}
+		break;
+	}
+
+	case CFG_CMD_LOAD_ALL:
+		LOG_INF("CFG: LOAD_ALL command");
+		if (IS_ENABLED(CONFIG_SETTINGS)) {
+			settings_load_subtree("cfg");
+			LOG_INF("CFG: Parameters reloaded from flash");
+			cfg_dump_values();
+		}
+		break;
+
+	case CFG_CMD_LIST_PARAMS: {
+		LOG_INF("CFG: LIST_PARAMS command");
+		int ret = cfg_build_list_response(&cfg_response_buf[4],
+						  CFG_REPORT_SIZE - 4);
+		cfg_response_buf[3] = (uint8_t)ret;
+		LOG_INF("CFG: LIST_PARAMS returning %u bytes", ret);
+		break;
+	}
+
+	default:
+		cfg_response_buf[1] = CFG_STATUS_UNKNOWN_CMD;
+		LOG_WRN("CFG: Unknown command: 0x%02x", cmd);
+		break;
+	}
+
+	cfg_response_pending = true;
+	return 0;
+}
+
+struct hid_device_ops cfg_ops = {
+	.iface_ready = cfg_iface_ready,
+	.get_report  = cfg_get_report,
+	.set_report  = cfg_set_report,
+};
+
+/* ============================================================
  *  BLE Central - HID 设备发现与连接
  * ============================================================ */
 
@@ -310,9 +788,6 @@ static struct bt_gatt_subscribe_params report_sub_params[MAX_REPORT_SUBS];
 /* 当前使用的 report_sub_params 索引 */
 static int report_sub_idx;
 
-/* GATT 发现保存的句柄 */
-static uint16_t mouse_value_handle;
-static uint16_t mouse_ccc_handle;
 /* 普通 Report (0x2A4D) 句柄记录 */
 static struct {
 	uint16_t value_handle;
@@ -989,14 +1464,13 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 	bt_addr_le_to_str(addr, dev, sizeof(dev));
 
-	/* 调试日志：打印所有扫描到的设备 */
-	LOG_INF("DEVICE: %s, RSSI %d, type %u", dev, rssi, type);
-
 	/* RSSI 过滤：信号不够强就不处理 */
 	if (rssi < BLE_HID_RSSI_THRESHOLD) {
-		LOG_DBG("RSSI too low: %d < %d", rssi, BLE_HID_RSSI_THRESHOLD);
 		return;
 	}
+
+	/* 信号够强才打印日志 */
+	LOG_INF("DEVICE: %s, RSSI %d, type %u", dev, rssi, type);
 
 	/* 只处理可连接广播 */
 	if (type != BT_GAP_ADV_TYPE_ADV_IND &&
@@ -1101,6 +1575,7 @@ int main(void)
 	struct usbd_context *sample_usbd;
 	const struct device *mouse_dev;
 	const struct device *kb_dev;
+	const struct device *cfg_dev;
 	int ret;
 
 	/* ---- 第1步：获取 HID 设备 ---- */
@@ -1113,6 +1588,12 @@ int main(void)
 	kb_dev = DEVICE_DT_GET(DT_NODELABEL(hid_dev_1));
 	if (!device_is_ready(kb_dev)) {
 		LOG_ERR("Keyboard HID device not ready");
+		return -EIO;
+	}
+
+	cfg_dev = DEVICE_DT_GET(DT_NODELABEL(hid_dev_2));
+	if (!device_is_ready(cfg_dev)) {
+		LOG_ERR("Config HID device not ready");
 		return -EIO;
 	}
 
@@ -1132,6 +1613,15 @@ int main(void)
 				  &kb_ops);
 	if (ret != 0) {
 		LOG_ERR("Failed to register keyboard HID, %d", ret);
+		return ret;
+	}
+
+	ret = hid_device_register(cfg_dev,
+				  hid_config_report_desc,
+				  sizeof(hid_config_report_desc),
+				  &cfg_ops);
+	if (ret != 0) {
+		LOG_ERR("Failed to register config HID, %d", ret);
 		return ret;
 	}
 
