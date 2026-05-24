@@ -1,18 +1,18 @@
 sample:
-  description: Hello World sample, the simplest Zephyr
-    application
-  name: hello world
+  description: BLE-to-USB HID Bridge for nRF52840 - connects Bluetooth mouse/keyboard and forwards HID reports via USB
+  name: BLE HID Bridge
 common:
-  min_ram: 2
-  min_flash: 16
-  tags: introduction
+  min_ram: 64
+  min_flash: 256
+  tags: bluetooth usb hid
   integration_platforms:
-    - native_sim
+    - nrf52840dk_nrf52840
   harness: console
   harness_config:
     type: one_line
     regex:
-      - "Hello World! (.*)"
+      - 'BLE initialized'
 tests:
-  sample.basic.helloworld:
-    tags: introduction
+  sample.basic.ble_hid_bridge:
+    tags: bluetooth usb hid
+    platform_allow: nrf52840dk_nrf52840
