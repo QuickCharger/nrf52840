@@ -1311,11 +1311,12 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 		LOG_ERR("Failed to connect to %s: %u", addr, conn_err);
 		bt_conn_unref(ble_conn);
 		ble_conn = NULL;
-		/* 连接失败，如果有绑定则启动自动重连，否则回退到扫描 */
+		/* 连接失败，如果有绑定则用 bond 筛选扫描，否则回退到普通扫描 */
 		if (mouse_bond_addr_valid) {
-			LOG_INF("Connection failed, starting auto reconnect...");
-			bt_conn_le_create_auto(BT_CONN_LE_CREATE_CONN_AUTO,
-					       BT_LE_CONN_PARAM_DEFAULT);
+			LOG_INF("Connection failed, starting scan (bond filter, 3s)...");
+			cdc_acm_print("CDC: Conn failed, bond filter 3s\r\n");
+			start_ble_scan();
+			k_work_schedule(&auto_connect_timeout_work, K_SECONDS(3));
 		} else {
 			k_work_schedule(&scan_timeout_work, K_SECONDS(3));
 		}
@@ -1325,17 +1326,16 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 	printk("=== Connected: %s ===\n", addr);
 	control_point_handle = 0;
 
-	/* 停止自动重连（已建立连接，不再需要硬件自动扫描） */
+	/* 停止硬件自动重连（安全清理，可能未启动） */
 	bt_conn_create_auto_stop();
-	/* 取消所有自动重连相关的定时器 */
+	/* 取消所有超时定时器 */
 	k_work_cancel_delayable(&auto_connect_timeout_work);
 	k_work_cancel_delayable(&delayed_auto_connect_work);
 
-	/* 将已连接的鼠标地址加入 Accept List（以备下次自动重连）*/
-	if (!mouse_bond_addr_valid) {
-		bt_addr_le_copy(&mouse_bond_addr, bt_conn_get_dst(conn));
-		mouse_bond_addr_valid = true;
-	}
+	/* 总是更新已连接鼠标的地址（M720 使用随机地址，每次可能不同）。
+	 * 保存最新地址：同设备槽重连时用精确匹配，提高可靠性。 */
+	bt_addr_le_copy(&mouse_bond_addr, bt_conn_get_dst(conn));
+	mouse_bond_addr_valid = true;
 	int al_err = bt_le_filter_accept_list_add(&mouse_bond_addr);
 	if (al_err) {
 		LOG_ERR("Accept List add failed in connected(): %d", al_err);
@@ -1403,17 +1403,25 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	/* M720 使用不同的随机地址（每次连接地址都不同），
 	 * Accept List + Auto Connect 无法匹配新地址。
-	 * 因此直接回退到普通扫描（MAC 前缀匹配），能发现任何 M720 地址。
+	 * 因此回退到软件扫描（MAC 前缀匹配）。
 	 *
 	 * 延迟 500ms 是必要的：disconnected() 在 HCI 事件上下文中调用，
 	 * HCI 命令缓冲池还未释放完毕，立即启动扫描可能失败。
+	 *
+	 * 有绑定时启用二阶段筛选：
+	 * Phase 1 (0-3.5s): mouse_bond_addr_valid=true 精确匹配（同设备槽快速重连）
+	 * Phase 2 (3.5s后): auto_connect_timeout_handler 清除验证，MAC前缀匹配任何 M720
 	 */
 	if (mouse_bond_addr_valid) {
-		LOG_INF("Disconnected, restarting BLE scan in 500ms...");
+		LOG_INF("Disconnected, restarting BLE scan in 500ms (bond filter, 3.5s timeout)...");
+		cdc_acm_print("CDC: Disconnected, bond filter 3.5s timeout\r\n");
 		k_work_schedule(&scan_timeout_work, K_MSEC(500));
+		/* 3.5s = 0.5s(HCI释放) + 3s(bond筛选)，确保扫描开始后有完整的3秒 Phase 1 */
+		k_work_schedule(&auto_connect_timeout_work, K_SECONDS(4));
 	} else {
 		/* 第一次使用，没有绑定，回退到普通扫描 */
-		LOG_INF("No bonded device or MIC failure, restarting BLE scan in 500ms...");
+		LOG_INF("No bonded device, restarting BLE scan in 500ms...");
+		cdc_acm_print("CDC: Disconnected, no bond, scanning\r\n");
 		k_work_schedule(&scan_timeout_work, K_MSEC(500));
 	}
 }
@@ -1431,7 +1439,16 @@ static void scan_timeout_handler(struct k_work *work)
 	start_ble_scan();
 }
 
-/* 自动重连超时处理：如果在规定时间内未连接成功，停止自动重连并回退到普通扫描 */
+/* 绑定筛选阶段超时处理。
+ *
+ * 在以下场景中调用：
+ * 1. 上电启动：有绑定时先 Phase 1（精确匹配），3秒后 Phase 2（MAC前缀匹配）
+ * 2. 断连重连：同上
+ * 3. 连接失败：同上
+ *
+ * 作用：清除 mouse_bond_addr_valid，允许 device_found() 使用 MAC 前缀匹配
+ * 任何 M720 鼠标（新设备槽/地址变化的情况）。
+ */
 static void auto_connect_timeout_handler(struct k_work *work)
 {
 	LOG_INF("Auto connect timeout, stopping and falling back to BLE scan...");
@@ -1795,33 +1812,33 @@ int main(void)
 		LOG_INF("Pairing callbacks registered (NoInputNoOutput + Just Works). "
 			"Will try security L2, fallback to WWoR");
 
-		/* 从 Flash 恢复绑定设备到 Accept List（白名单）*/
+		/* 从 Flash 恢复绑定设备地址 */
 		mouse_bond_addr_valid = false;
 		bt_foreach_bond(BT_ID_DEFAULT, bond_restore_cb, NULL);
 
 		if (mouse_bond_addr_valid) {
-			/* 有绑定设备，启动硬件级自动重连（Accept List + Auto Connect）
-			 * BLE 控制器自动扫描定向广播（ADV_DIRECT_IND），
-			 * 发现鼠标后自动发起连接，不需要软件扫描
+			/* 有绑定设备：立即启动软件扫描，同时启用绑定地址筛选（Phase 1）。
 			 *
-			 * 同时设置 3 秒超时：如果自动重连超时未连上，
-			 * 停止自动重连并回退到普通扫描模式。
-			 * Auto Connect 只对使用相同地址的定向广播有效，
-			 * M720 每次地址不同，大概率会超时回退到扫描。
+			 * M720 每次连接使用不同的随机地址，硬件自动重连
+			 * (bt_conn_le_create_auto) 基于 Accept List 固定地址，
+			 * 对 M720 无效。改用软件扫描 + 二阶段筛选：
+			 *
+			 * Phase 1 (0-3秒): mouse_bond_addr_valid=true
+			 *   device_found() 只匹配精确的绑定地址，
+			 *   用于快速重连到同一设备槽（地址未变的情况）。
+			 *
+			 * Phase 2 (3秒后): auto_connect_timeout_handler 清除
+			 *   mouse_bond_addr_valid=false，允许 MAC 前缀匹配
+			 *   任何 M720（新设备槽/地址变化的情况）。
 			 */
-			LOG_INF("Bonded mouse found, starting auto connect (3s timeout)...");
-			int err = bt_conn_le_create_auto(BT_CONN_LE_CREATE_CONN_AUTO,
-			 			BT_LE_CONN_PARAM_DEFAULT);
-			if (err) {
-			 LOG_ERR("Auto connect failed: %d, fallback to scan", err);
-			 start_ble_scan();
-			} else {
-			 /* 自动重连启动成功，设置 3 秒后备超时 */
-			 k_work_schedule(&auto_connect_timeout_work, K_SECONDS(3));
-			}
+			LOG_INF("Bonded mouse found, starting scan (bond filter, 3s timeout)...");
+			cdc_acm_print("CDC: Boot - bond filter active (3s)\r\n");
+			start_ble_scan();
+			k_work_schedule(&auto_connect_timeout_work, K_SECONDS(3));
 		} else {
 			/* 没有绑定设备（第一次使用），启动普通 BLE 扫描 */
 			LOG_INF("No bonded device, starting BLE scan...");
+			cdc_acm_print("CDC: No bonded device, scanning\r\n");
 			start_ble_scan();
 		}
 	}
