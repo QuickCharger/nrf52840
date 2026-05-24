@@ -4,30 +4,54 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * USB HID Mouse + Keyboard 示例
- * - 鼠标每 0.1 秒向右移动 10 像素
- * - 键盘每 1 秒按一个字母，从 A 到 Z 循环
+ * USB HID Mouse + Keyboard + BLE HID Client (HOGP)
+ *
+ * - USB HID Mouse: 转发蓝牙鼠标数据到电脑
+ * - USB HID Keyboard: 自动打字演示(A-Z循环)
+ * - BLE Central: 扫描并连接蓝牙鼠标(HID Service), 通过HOGP Client接收鼠标报告
  */
 
 #include <sample_usbd.h>
 
 #include <string.h>
+#include <errno.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/byteorder.h>
 
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_hid.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+
+#include <bluetooth/gatt_dm.h>
+
+#include <zephyr/settings/settings.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 /* ============================================================
- *  鼠标相关
+ *  RSSI 阈值：信号强度 >= -70 dBm 时尝试连接
+ *  初始调试阶段可降低到 -90，生产环境建议 -60
+ * ============================================================ */
+#define BLE_HID_RSSI_THRESHOLD  (-90)
+
+/* 调试阶段：直接指定鼠标 MAC 地址 */
+#define BLE_MOUSE_TARGET_MAC   "FB:DE:BD:46:FF:0B"
+
+/* ============================================================
+ *  鼠标相关 (USB HID)
  * ============================================================ */
 static const uint8_t hid_mouse_report_desc[] = HID_MOUSE_REPORT_DESC(2);
 
+/* USB HID Mouse Report 格式: [按钮, X(int8), Y(int8), 滚轮(int8)] */
 enum mouse_report_idx {
 	MOUSE_BTN_REPORT_IDX = 0,
 	MOUSE_X_REPORT_IDX = 1,
@@ -39,27 +63,118 @@ enum mouse_report_idx {
 K_MSGQ_DEFINE(mouse_msgq, MOUSE_REPORT_COUNT, 10, 1);
 static bool mouse_ready;
 
-/* 鼠标自动移动任务：每0.1秒向右移动10像素 */
-void auto_mouse_task(void *arg1, void *arg2, void *arg3)
+/* ============================================================
+ *  Accept List（白名单）自动重连
+ *  ============================================================
+ *  绑定成功后，鼠标地址加入 Filter Accept List，
+ *  断连后调用 bt_conn_le_create_auto() 启动硬件级自动重连。
+ *  BLE 控制器自动扫描定向广播，发现鼠标后自动发起连接请求。
+ *  断电重启后，bt_foreach_bond() 从 Flash 恢复绑定地址。
+ *  ============================================================ */
+static bt_addr_le_t mouse_bond_addr;
+static bool mouse_bond_addr_valid;
+
+/* 从 7 字节鼠标报告中提取 12-bit 有符号 X/Y 值，缩放到 [-127, 127]
+ *
+ * HID Report Map (Report ID 2) 位布局:
+ *   Byte 0-1: buttons[15:0]  (16 × 1 bit)
+ *   Byte 2:   X[7:0]         (低 8 位)
+ *   Byte 3:   X[11:8] | Y[3:0]<<4  (X 高 4 位 + Y 低 4 位打包在同一字节)
+ *   Byte 4:   Y[11:4]        (Y 高 8 位)
+ *   Byte 5:   Wheel (signed 8-bit)
+ *   Byte 6:   AC Pan (signed 8-bit, 水平滚轮)
+ *
+ * 12-bit 有符号值范围: -2047 ~ 2047
+ * USB HID 8-bit 范围: -127 ~ 127
+ */
+static void unpack_mouse_report_7byte(const uint8_t *data,
+				      uint8_t *report)
 {
-	static uint8_t report[MOUSE_REPORT_COUNT] = {0};
+	/* 7 字节报告布局 (HID Report ID 2):
+	 *   data[0] = buttons byte 0 (bit0=左键, bit1=右键, bit2=中键)
+	 *   data[1] = buttons byte 1 (保留)
+	 *   data[2] = X[7:0]       (低 8 位)
+	 *   data[3] = X[11:8] | Y[3:0]<<4  (X 高 4 位 + Y 低 4 位)
+	 *   data[4] = Y[11:4]      (Y 高 8 位)
+	 *   data[5] = Wheel (signed 8-bit)
+	 *   data[6] = AC Pan (水平滚轮, signed 8-bit)
+	 */
 
-	while (1) {
-		report[MOUSE_X_REPORT_IDX] = 10;
-		report[MOUSE_Y_REPORT_IDX] = 0;
+	/* 提取 X: 12-bit 无符号 */
+	uint16_t x_raw = (uint16_t)(data[2] | ((data[3] & 0x0F) << 8));
+	/* 提取 Y: 12-bit 无符号 */
+	uint16_t y_raw = (uint16_t)(((data[3] >> 4) & 0x0F) | (data[4] << 4));
 
-		if (k_msgq_put(&mouse_msgq, report, K_NO_WAIT) != 0) {
-			LOG_ERR("Failed to put mouse move event");
-		} else {
-			LOG_INF("Auto mouse: X+10");
-		}
+	/* 转换为 12-bit 有符号 (二进制补码, 范围 -2047~2047) */
+	int16_t x_val = (x_raw >= 0x0800) ? (int16_t)(x_raw - 4096) : (int16_t)x_raw;
+	int16_t y_val = (y_raw >= 0x0800) ? (int16_t)(y_raw - 4096) : (int16_t)y_raw;
 
-		k_msleep(100);
-	}
+	/* 直接截断到 USB HID 8-bit 范围 [-127, 127]
+	 * 不缩放: 12-bit 值的 ±2047 范围很少用到,
+	 * 实际移动幅度通常 <127, 缩放反而导致小移动被舍入为 0
+	 */
+	if (x_val > 127) x_val = 127;
+	if (x_val < -127) x_val = -127;
+	if (y_val > 127) y_val = 127;
+	if (y_val < -127) y_val = -127;
+
+	/* 按钮: data[0] 低 3 位 = 左键/右键/中键 */
+	report[MOUSE_BTN_REPORT_IDX] = data[0] & 0x07;
+	report[MOUSE_X_REPORT_IDX] = (uint8_t)x_val;
+	report[MOUSE_Y_REPORT_IDX] = (uint8_t)y_val;
+
+	/* 滚轮 */
+	report[MOUSE_WHEEL_REPORT_IDX] = data[5];
 }
 
-K_THREAD_STACK_DEFINE(auto_mouse_stack, 1024);
-static struct k_thread auto_mouse_thread;
+/* BLE 鼠标通知回调 - 根据 HID Report Map 解析鼠标报告
+ *
+ * M720 通过多个特征值发送数据:
+ *   [1] Boot Mouse (0x2A4B) 3 字节: [buttons, X(int8), Y(int8)]
+ *   [2] Report (0x2A4D) handle 0x0030 7 字节: HID Report ID 2 鼠标报告
+ *       (见 unpack_mouse_report_7byte 的位布局)
+ *   [3] Report (0x2A4D) handle 0x0034 19 字节: Report ID 0x11 (17),
+ *       Logitech HID++ 厂商报告, data[0]!=0xFF 但通过 len==19 识别
+ *
+ * 处理策略:
+ *   - len == 19 → Logitech HID++ 报告, 跳过
+ *   - len <= 3  → Boot Mouse 格式 [buttons, X(int8), Y(int8)]
+ *   - len >= 7  → Report ID 2 格式, 用 unpack_mouse_report_7byte 解析
+ */
+static void ble_mouse_report_forward(const uint8_t *data, uint16_t len)
+{
+	uint8_t report[MOUSE_REPORT_COUNT] = {0};
+
+	if (len < 3) {
+		LOG_WRN("Short mouse report: %u bytes", len);
+		return;
+	}
+
+	/* 打印原始数据前 7 字节用于调试 */
+	LOG_INF("RAW[%u]: %02x %02x %02x %02x %02x %02x %02x",
+		len,
+		data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
+
+	/* 跳过 19 字节 Logitech HID++ 报告 (Report ID 0x11) */
+	if (len == 19) {
+		LOG_DBG("Skipping HID++ report (19 bytes)");
+		return;
+	}
+
+	if (len <= 3) {
+		/* Boot Mouse 格式: [buttons(1B), X(int8), Y(int8)] */
+		report[MOUSE_BTN_REPORT_IDX] = data[0];
+		report[MOUSE_X_REPORT_IDX] = data[1];
+		report[MOUSE_Y_REPORT_IDX] = data[2];
+	} else {
+		/* 7 字节 Report ID 2 格式: 用 HID Report Map 定义的位布局解析 */
+		unpack_mouse_report_7byte(data, report);
+	}
+
+	if (k_msgq_put(&mouse_msgq, report, K_NO_WAIT) != 0) {
+		LOG_DBG("Mouse msgq full, dropping report");
+	}
+}
 
 static void mouse_iface_ready(const struct device *dev, const bool ready)
 {
@@ -80,7 +195,7 @@ struct hid_device_ops mouse_ops = {
 };
 
 /* ============================================================
- *  键盘相关
+ *  键盘相关 (USB HID) - 自动打字演示
  * ============================================================ */
 static const uint8_t hid_keyboard_report_desc[] = HID_KEYBOARD_REPORT_DESC();
 
@@ -97,7 +212,7 @@ enum kb_report_idx {
 };
 
 /* HID 键盘码：A=0x04, B=0x05, ..., Z=0x1D */
-static const uint8_t hid_keycodes[] = {
+static const uint8_t hid_keycodes[] __maybe_unused = {
 	0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
 	0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13,
 	0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
@@ -107,7 +222,8 @@ static const uint8_t hid_keycodes[] = {
 K_MSGQ_DEFINE(kb_msgq, KB_REPORT_COUNT, 10, 1);
 static bool kb_ready;
 
-/* 键盘自动打字任务：每1秒按一个字母，A-Z循环 */
+#if 0
+/* 键盘自动打字任务：每1秒按一个字母，A-Z循环（调试用，暂时关闭） */
 void auto_keyboard_task(void *arg1, void *arg2, void *arg3)
 {
 	uint8_t index = 0;
@@ -145,6 +261,7 @@ void auto_keyboard_task(void *arg1, void *arg2, void *arg3)
 
 K_THREAD_STACK_DEFINE(auto_keyboard_stack, 2048);
 static struct k_thread auto_keyboard_thread;
+#endif /* 0 - auto keyboard task disabled */
 
 static void kb_iface_ready(const struct device *dev, const bool ready)
 {
@@ -163,6 +280,818 @@ struct hid_device_ops kb_ops = {
 	.iface_ready = kb_iface_ready,
 	.get_report = kb_get_report,
 };
+
+/* ============================================================
+ *  BLE Central - HID 设备发现与连接
+ * ============================================================ */
+
+/* BLE 连接对象 */
+static struct bt_conn *ble_conn;
+/* 是否已订阅鼠标通知 */
+static bool mouse_subscribed;
+/* HID Control Point 句柄（用于 Exit Suspend） */
+static uint16_t control_point_handle;
+/* 扫描超时计时器 */
+static struct k_work_delayable scan_timeout_work;
+/* 自动重连超时计时器：Auto Connect 15秒内未连上则回退到普通扫描 */
+static struct k_work_delayable auto_connect_timeout_work;
+/* 延迟自动重连工作项：断连后延迟500ms启动，给HCI堆栈时间清理资源 */
+static struct k_work_delayable delayed_auto_connect_work;
+/* 连接状态监测定时器 */
+static struct k_work_delayable conn_status_work;
+
+/* 最多支持的 Report 订阅数量 */
+#define MAX_REPORT_SUBS 4
+
+/* 手动 GATT 订阅参数（必须保持有效直到取消订阅） */
+static struct bt_gatt_subscribe_params mouse_sub_params;
+/* 备用订阅参数数组：用于普通 Report (0x2A4D) 特征值 */
+static struct bt_gatt_subscribe_params report_sub_params[MAX_REPORT_SUBS];
+/* 当前使用的 report_sub_params 索引 */
+static int report_sub_idx;
+
+/* GATT 发现保存的句柄 */
+static uint16_t mouse_value_handle;
+static uint16_t mouse_ccc_handle;
+/* 普通 Report (0x2A4D) 句柄记录 */
+static struct {
+	uint16_t value_handle;
+	uint16_t ccc_handle;
+} report_handles[MAX_REPORT_SUBS];
+static int report_handles_count;
+
+/* HID Report Map 读取 */
+#define HID_REPORT_MAP_MAX_SIZE 256
+static uint8_t report_map_data[HID_REPORT_MAP_MAX_SIZE];
+static uint16_t report_map_len;
+static struct bt_gatt_read_params report_map_read_params;
+
+/* ---------- 前向声明 ---------- */
+static void start_ble_scan(void);
+
+/* ---------- HID Report Map 读取 ---------- */
+
+/* Report Map 读取完成回调 */
+static uint8_t report_map_read_cb(struct bt_conn *conn, uint8_t err,
+				  struct bt_gatt_read_params *params,
+				  const void *data, uint16_t length)
+{
+	if (err) {
+		LOG_WRN("Report Map read error: %d", err);
+		return BT_GATT_ITER_STOP;
+	}
+
+	/* 累积数据（可能分多次回调） */
+	if (data && length > 0) {
+		if (report_map_len + length > HID_REPORT_MAP_MAX_SIZE) {
+			LOG_WRN("Report Map too large, truncating");
+			length = HID_REPORT_MAP_MAX_SIZE - report_map_len;
+		}
+		memcpy(report_map_data + report_map_len, data, length);
+		report_map_len += length;
+		LOG_INF("Report Map chunk: %u bytes (total %u)", length, report_map_len);
+		return BT_GATT_ITER_CONTINUE;
+	}
+
+	/* 读取完成，打印 Report Map */
+	LOG_INF("=== HID Report Map (%u bytes) ===", report_map_len);
+	for (uint16_t i = 0; i < report_map_len; i += 16) {
+		char hex[64], ascii[20];
+		int pos = 0, apos = 0;
+		for (uint16_t j = i; j < i + 16 && j < report_map_len; j++) {
+			pos += snprintf(hex + pos, sizeof(hex) - pos,
+					"%02x ", report_map_data[j]);
+			apos += snprintf(ascii + apos, sizeof(ascii) - apos,
+					 "%c", (report_map_data[j] >= 32 && report_map_data[j] < 127)
+					       ? report_map_data[j] : '.');
+		}
+		LOG_INF("  %04x: %-48s %s", i, hex, ascii);
+	}
+
+	/* TODO: 解析 Report Map 中 Input Report 格式，自动确定 X/Y 偏移 */
+
+	return BT_GATT_ITER_STOP;
+}
+
+/* ---------- GATT 订阅通知回调 ---------- */
+
+static uint8_t mouse_notify_cb(struct bt_conn *conn,
+			       struct bt_gatt_subscribe_params *params,
+			       const void *data, uint16_t length)
+{
+	if (data == NULL) {
+		LOG_INF("Mouse unsubscribed (handle 0x%04x)",
+			params->value_handle);
+		mouse_subscribed = false;
+		return BT_GATT_ITER_STOP;
+	}
+
+	LOG_INF("BLE mouse report received: %u bytes from handle 0x%04x",
+		length, params->value_handle);
+
+	/* 将 BLE 鼠标数据转发到 USB HID */
+	ble_mouse_report_forward(data, length);
+	return BT_GATT_ITER_CONTINUE;
+}
+
+/* 连接状态周期性检查：每5秒打印一次连接状态 */
+static void conn_status_handler(struct k_work *work)
+{
+	if (ble_conn) {
+		struct bt_conn_info info;
+		int err = bt_conn_get_info(ble_conn, &info);
+		if (err == 0) {
+			LOG_INF("--- Connection alive: state=%d, sec_level=%d, "
+				"subscribed=%d ---",
+				info.state, info.security.level,
+				mouse_subscribed);
+		}
+		/* 继续每5秒检查一次 */
+		k_work_schedule(&conn_status_work, K_SECONDS(5));
+	}
+}
+
+/* ---------- GATT Discovery Manager 回调 ---------- */
+
+/* 打印发现的属性 - 调试用 */
+static void print_discovered_attrs(struct bt_gatt_dm *dm)
+{
+	const struct bt_gatt_dm_attr *attr = NULL;
+
+	LOG_INF("--- Discovered HID Service attributes ---");
+	/* 先打印度服务 */
+	attr = bt_gatt_dm_service_get(dm);
+	if (attr) {
+		char uuid_str[BT_UUID_STR_LEN];
+		bt_uuid_to_str(attr->uuid, uuid_str, sizeof(uuid_str));
+		LOG_INF("  Service: %s handle=0x%04x", uuid_str, attr->handle);
+	}
+
+	/* 遍历所有特征值和描述符 */
+	attr = NULL;
+	while ((attr = bt_gatt_dm_attr_next(dm, attr)) != NULL) {
+		char uuid_str[BT_UUID_STR_LEN];
+		bt_uuid_to_str(attr->uuid, uuid_str, sizeof(uuid_str));
+		LOG_INF("  Attr: %s handle=0x%04x perm=0x%02x",
+			uuid_str, attr->handle, attr->perm);
+	}
+	LOG_INF("--- End of attributes ---");
+}
+
+/* 通过 WWoR 写入 CCC 并调用 bt_gatt_resubscribe 订阅
+ *
+ * bt_gatt_subscribe() 内部使用 Write Request（带响应），
+ * 鼠标会返回 "Insufficient Authentication" 错误，
+ * 导致 Zephyr 自动触发安全升级 -> 配对失败 -> 断开连接。
+ *
+ * 解决方案：
+ * 1. bt_gatt_write_without_response() 写 CCC 0x0001
+ *    (Write Command，无响应，不触发安全升级)
+ * 2. bt_gatt_resubscribe() 注册通知回调
+ *    (只添加到订阅列表，不写 CCC)
+ */
+static void subscribe_char_via_wwor(uint16_t value_handle, uint16_t ccc_handle,
+				    struct bt_gatt_subscribe_params *params,
+				    const char *desc)
+{
+	int err;
+	uint16_t ccc_value = BT_GATT_CCC_NOTIFY;
+
+	LOG_INF("Subscribing to %s: value=0x%04x ccc=0x%04x",
+		desc, value_handle, ccc_handle);
+
+	/* 第1步：Write Without Response 写 CCC */
+	err = bt_gatt_write_without_response(ble_conn, ccc_handle,
+					    &ccc_value, sizeof(ccc_value),
+					    false);
+	if (err) {
+		LOG_ERR("  CCC WWoR failed for %s: %d", desc, err);
+	} else {
+		LOG_INF("  CCC WWoR queued for %s", desc);
+	}
+
+	/* 第2步：bt_gatt_resubscribe 注册回调
+	 *
+	 * 注意：params 必须是静态或长期有效的变量（不能是栈变量），
+	 * 且每个不同的订阅必须使用不同的 params 指针。
+	 * 这里不调用 memset，因为 params 是静态变量，初始为全零。
+	 */
+	const bt_addr_le_t *peer = bt_conn_get_dst(ble_conn);
+	params->notify = mouse_notify_cb;
+	params->value = BT_GATT_CCC_NOTIFY;
+	params->value_handle = value_handle;
+	params->ccc_handle = ccc_handle;
+	params->min_security = BT_SECURITY_L1;
+
+	err = bt_gatt_resubscribe(BT_ID_DEFAULT, peer, params);
+	if (err) {
+		LOG_ERR("  bt_gatt_resubscribe failed for %s: %d", desc, err);
+	} else {
+		mouse_subscribed = true;
+		LOG_INF("  Subscribed to %s (WWoR + resubscribe)", desc);
+	}
+}
+
+static void discovery_completed(struct bt_gatt_dm *dm, void *context)
+{
+	LOG_INF("GATT discovery completed");
+
+	/* 打印发现的所有属性 */
+	print_discovered_attrs(dm);
+
+	/* 清除计数 */
+	report_handles_count = 0;
+
+	/* ---- 第1步：订阅 Boot Mouse Input Report (0x2A4B) ---- */
+	const struct bt_gatt_dm_attr *boot_mouse_chrc;
+	boot_mouse_chrc = bt_gatt_dm_char_by_uuid(dm,
+						BT_UUID_HIDS_BOOT_MOUSE_IN_REPORT);
+	if (boot_mouse_chrc) {
+		uint16_t value_handle =
+			bt_gatt_dm_attr_chrc_val(boot_mouse_chrc)->value_handle;
+		LOG_INF("Boot Mouse Input Report FOUND: value_handle=0x%04x",
+			value_handle);
+
+		const struct bt_gatt_dm_attr *ccc =
+			bt_gatt_dm_desc_by_uuid(dm, boot_mouse_chrc,
+						BT_UUID_GATT_CCC);
+		if (ccc) {
+			subscribe_char_via_wwor(value_handle, ccc->handle,
+						&mouse_sub_params,
+						"Boot Mouse (0x2A4B)");
+		} else {
+			LOG_WRN("No CCC for Boot Mouse");
+		}
+	} else {
+		LOG_WRN("Boot Mouse Input Report NOT FOUND");
+	}
+
+	/* ---- 第2步：遍历所有 Report (0x2A4D) 特征值并订阅 ----
+	 * 罗技鼠标可能通过普通 Report 而非 Boot Mouse 发送数据
+	 */
+	report_sub_idx = 0;
+	const struct bt_gatt_dm_attr *attr = NULL;
+	while ((attr = bt_gatt_dm_attr_next(dm, attr)) != NULL) {
+		/* 查找 Characteristic 声明 (2803) */
+		if (attr->uuid->type != BT_UUID_TYPE_16) {
+			continue;
+		}
+		const struct bt_uuid_16 *u16 = CONTAINER_OF(
+			attr->uuid, const struct bt_uuid_16, uuid);
+		if (u16->val != BT_UUID_GATT_CHRC_VAL) {
+			continue;
+		}
+
+		/* 获取特征值 UUID */
+		struct bt_gatt_chrc *chrc_val =
+			bt_gatt_dm_attr_chrc_val(attr);
+		if (chrc_val->uuid->type != BT_UUID_TYPE_16) {
+			continue;
+		}
+		const struct bt_uuid_16 *chrc_u16 = CONTAINER_OF(
+			chrc_val->uuid, const struct bt_uuid_16, uuid);
+
+		/* 检查是否为 HID Control Point (0x2A4C) */
+		if (chrc_u16->val == BT_UUID_HIDS_CTRL_POINT_VAL) {
+			control_point_handle = chrc_val->value_handle;
+			LOG_INF("  Control Point (0x2A4C) FOUND: value_handle=0x%04x",
+				control_point_handle);
+			continue;
+		}
+
+		/* 只处理 Report 特征值 (0x2A4D) */
+		if (chrc_u16->val != BT_UUID_HIDS_REPORT_VAL) {
+			continue;
+		}
+
+		uint16_t value_handle = chrc_val->value_handle;
+
+		/* 查找该特征值对应的 CCC */
+		const struct bt_gatt_dm_attr *ccc =
+			bt_gatt_dm_desc_by_uuid(dm, attr, BT_UUID_GATT_CCC);
+		if (!ccc) {
+			LOG_INF("  Report (0x2A4D) value=0x%04x: no CCC, skip",
+				value_handle);
+			continue;
+		}
+
+		/* 保存句柄供后续使用 */
+		if (report_handles_count < MAX_REPORT_SUBS) {
+			report_handles[report_handles_count].value_handle =
+				value_handle;
+			report_handles[report_handles_count].ccc_handle =
+				ccc->handle;
+			report_handles_count++;
+		}
+
+		/* 只订阅 Report 特征值（不是 Boot Mouse 也不是 Control Point）*/
+		if (report_sub_idx < MAX_REPORT_SUBS) {
+			char desc[32];
+			snprintf(desc, sizeof(desc),
+				 "Report %d (0x2A4D)", report_sub_idx + 1);
+			subscribe_char_via_wwor(value_handle, ccc->handle,
+						&report_sub_params[report_sub_idx],
+						desc);
+			report_sub_idx++;
+		}
+	}
+
+	/* ---- 第3步：写入 HID Control Point "Exit Suspend" (0x01) via WWoR ----
+		* 如果鼠标之前处于 Suspend 状态，写 Exit Suspend 可以唤醒它
+		* 使鼠标开始发送 HID 报告
+		*/
+	if (control_point_handle) {
+		uint8_t cp_value = 0x01; /* Exit Suspend */
+		LOG_INF("Writing Control Point (0x2A4C) Exit Suspend=0x%02x "
+			"via WWoR...", cp_value);
+		int err = bt_gatt_write_without_response(ble_conn,
+					control_point_handle,
+					&cp_value, sizeof(cp_value), false);
+		if (err) {
+			LOG_ERR("  Control Point WWoR failed: %d", err);
+		} else {
+			LOG_INF("  Control Point Exit Suspend queued");
+		}
+	} else {
+		LOG_INF("No Control Point found, skip");
+	}
+
+	/* ---- 第4步：读取 HID Report Map (0x2A4B) ----
+	 * Report Map 包含 HID Report Descriptor，定义了鼠标报告的精确格式
+	 * （如 X/Y 是 8-bit 还是 16-bit，字节偏移等）
+	 */
+	const struct bt_gatt_dm_attr *report_map_attr;
+	report_map_attr = bt_gatt_dm_char_by_uuid(dm, BT_UUID_HIDS_REPORT_MAP);
+	if (report_map_attr) {
+		uint16_t report_map_handle =
+			bt_gatt_dm_attr_chrc_val(report_map_attr)->value_handle;
+		LOG_INF("Report Map (0x2A4B) FOUND: value_handle=0x%04x",
+			report_map_handle);
+
+		/* 准备读取参数 */
+		report_map_len = 0;
+		report_map_read_params.func = report_map_read_cb;
+		report_map_read_params.handle_count = 1;
+		report_map_read_params.single.handle = report_map_handle;
+		report_map_read_params.single.offset = 0;
+
+		int err = bt_gatt_read(ble_conn, &report_map_read_params);
+		if (err) {
+			LOG_ERR("  Report Map read failed: %d", err);
+		} else {
+			LOG_INF("  Report Map read initiated...");
+		}
+	} else {
+		LOG_WRN("Report Map (0x2A4B) NOT FOUND");
+	}
+
+	/* 释放发现数据 */
+	bt_gatt_dm_data_release(dm);
+
+	/* 启动连接状态监测 */
+	k_work_schedule(&conn_status_work, K_SECONDS(5));
+}
+
+static void discovery_service_not_found(struct bt_conn *conn, void *context)
+{
+	LOG_WRN("HID Service not found on this device, disconnecting...");
+	bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+}
+
+static void discovery_error(struct bt_conn *conn, int err, void *context)
+{
+	LOG_ERR("GATT discovery error: %d", err);
+	bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+}
+
+/* GATT DM 回调结构体 */
+static const struct bt_gatt_dm_cb dm_cb = {
+	.completed = discovery_completed,
+	.service_not_found = discovery_service_not_found,
+	.error_found = discovery_error,
+};
+
+/* ---------- 配对/认证回调 ---------- */
+
+static void pairing_confirm(struct bt_conn *conn)
+{
+	LOG_INF("Pairing confirm - auto accepting");
+	bt_conn_auth_pairing_confirm(conn);
+}
+
+static void auth_cancel(struct bt_conn *conn)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_WRN("Pairing cancelled: %s", addr);
+}
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_INF("Pairing complete: %s, bonded: %d", addr, bonded);
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_WRN("Pairing FAILED: %s, reason %d %s", addr, reason,
+		bt_security_err_to_str(reason));
+}
+
+static struct bt_conn_auth_cb auth_callbacks = {
+	.pairing_confirm = pairing_confirm,
+	.cancel = auth_cancel,
+};
+
+/* ---------- Accept List（白名单）回调 ---------- */
+
+/* 从 Flash 恢复绑定设备到 Accept List */
+static void bond_restore_cb(const struct bt_bond_info *info, void *user_data)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+	bt_addr_le_to_str(&info->addr, addr, sizeof(addr));
+
+	LOG_INF("Restoring bonded device: %s", addr);
+
+	/* 保存地址 */
+	bt_addr_le_copy(&mouse_bond_addr, &info->addr);
+	mouse_bond_addr_valid = true;
+
+	/* 加入 Accept List */
+	int err = bt_le_filter_accept_list_add(&info->addr);
+	if (err) {
+		LOG_ERR("  accept list add FAILED: %d", err);
+	} else {
+		LOG_INF("  Added to filter accept list");
+	}
+}
+
+static struct bt_conn_auth_info_cb auth_info_callbacks = {
+	.pairing_complete = pairing_complete,
+	.pairing_failed = pairing_failed,
+};
+
+/* ---------- BLE 安全/加密状态变化 ---------- */
+
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+			     enum bt_security_err err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	if (err) {
+		printk("=== Security: %s, level %u, FAILED: err %d %s ===\n",
+		       addr, level, err, bt_security_err_to_str(err));
+	} else {
+		printk("=== Security changed: %s, level %u ===\n", addr, level);
+	}
+
+	/* 无论安全是否成功，都尝试 GATT 发现（同 central_hids 官方做法） */
+	printk("=== Starting GATT discovery ===\n");
+	int ret = bt_gatt_dm_start(conn, BT_UUID_HIDS, &dm_cb, NULL);
+	if (ret) {
+		LOG_ERR("GATT DM start failed: %d", ret);
+	}
+}
+
+/* ---------- BLE 连接回调 ---------- */
+
+static void connected(struct bt_conn *conn, uint8_t conn_err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	if (conn_err) {
+		LOG_ERR("Failed to connect to %s: %u", addr, conn_err);
+		bt_conn_unref(ble_conn);
+		ble_conn = NULL;
+		/* 连接失败，如果有绑定则启动自动重连，否则回退到扫描 */
+		if (mouse_bond_addr_valid) {
+			LOG_INF("Connection failed, starting auto reconnect...");
+			bt_conn_le_create_auto(BT_CONN_LE_CREATE_CONN_AUTO,
+					       BT_LE_CONN_PARAM_DEFAULT);
+		} else {
+			k_work_schedule(&scan_timeout_work, K_SECONDS(3));
+		}
+		return;
+	}
+
+	printk("=== Connected: %s ===\n", addr);
+	control_point_handle = 0;
+
+	/* 停止自动重连（已建立连接，不再需要硬件自动扫描） */
+	bt_conn_create_auto_stop();
+	/* 取消所有自动重连相关的定时器 */
+	k_work_cancel_delayable(&auto_connect_timeout_work);
+	k_work_cancel_delayable(&delayed_auto_connect_work);
+
+	/* 将已连接的鼠标地址加入 Accept List（以备下次自动重连）*/
+	if (!mouse_bond_addr_valid) {
+		bt_addr_le_copy(&mouse_bond_addr, bt_conn_get_dst(conn));
+		mouse_bond_addr_valid = true;
+	}
+	int al_err = bt_le_filter_accept_list_add(&mouse_bond_addr);
+	if (al_err) {
+		LOG_ERR("Accept List add failed in connected(): %d", al_err);
+	} else {
+		LOG_INF("Added %s to Accept List in connected()", addr);
+	}
+
+	/* 直接调用 bt_conn_set_security，同 central_hids 官方做法 */
+	int err = bt_conn_set_security(conn, BT_SECURITY_L2);
+	if (err) {
+		printk("=== bt_conn_set_security failed: %d, starting GATT DM directly ===\n",
+		       err);
+		int ret = bt_gatt_dm_start(conn, BT_UUID_HIDS, &dm_cb, NULL);
+		if (ret) {
+			LOG_ERR("GATT DM start failed: %d", ret);
+		}
+	} else {
+		printk("=== bt_conn_set_security OK, waiting for security_changed ===\n");
+	}
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_WRN("Disconnected: %s, reason 0x%02x %s",
+		addr, reason, bt_hci_err_to_str(reason));
+
+	if (ble_conn != conn) {
+		return;
+	}
+
+	bt_conn_unref(ble_conn);
+	ble_conn = NULL;
+	mouse_subscribed = false;
+
+	/* 取消所有定时器 */
+	k_work_cancel_delayable(&conn_status_work);
+	k_work_cancel_delayable(&delayed_auto_connect_work);
+
+	/* 处理连接建立失败（reason 0x3e）：
+	 *
+	 * M720 每次切换到同一设备槽时，可能使用不同的随机地址重连
+	 * （如 FF:1D → FF:07），但在同一会话中地址保持不变。
+	 *
+	 * M720 自身存储了设备槽 3 的绑定信息（来自第一次 FF:1D 配对），
+	 * 重连时 M720 可能立即用存储的 LTK 发起加密请求。
+	 * 但我们的主机没有新地址（FF:07）的绑定（绑定的是旧地址 FF:1D），
+	 * 控制器找不到 LTK → 0x3e（连接建立失败）。
+	 *
+	 * 注意：不要在这里调用 bt_unpair()！M720 自身仍有绑定，
+	 * 删除我们的绑定只会让 M720 拒绝新配对（err 9 = Pair Not Supported）。
+	 * 正确的做法是启用 RPA 解析（CONFIG_BT_PRIVACY），
+	 * 让 nRF 能将不同随机地址解析到同一身份地址。
+	 *
+	 * 这里只清除 Accept List（对 M720 的随机地址无意义），
+	 * 然后重新扫描，MAC 前缀匹配会再次发现 M720。
+	 */
+	if (reason == BT_HCI_ERR_CONN_FAIL_TO_ESTAB) {
+		LOG_WRN("0x3e: clearing Accept List, keeping bond (M720 has stored bond)");
+		bt_le_filter_accept_list_clear();
+		/* 不调用 bt_unpair()！保留绑定，让 RPA 解析能找到 LTK */
+	}
+
+	/* M720 使用不同的随机地址（每次连接地址都不同），
+	 * Accept List + Auto Connect 无法匹配新地址。
+	 * 因此直接回退到普通扫描（MAC 前缀匹配），能发现任何 M720 地址。
+	 *
+	 * 延迟 500ms 是必要的：disconnected() 在 HCI 事件上下文中调用，
+	 * HCI 命令缓冲池还未释放完毕，立即启动扫描可能失败。
+	 */
+	if (mouse_bond_addr_valid) {
+		LOG_INF("Disconnected, restarting BLE scan in 500ms...");
+		k_work_schedule(&scan_timeout_work, K_MSEC(500));
+	} else {
+		/* 第一次使用，没有绑定，回退到普通扫描 */
+		LOG_INF("No bonded device or MIC failure, restarting BLE scan in 500ms...");
+		k_work_schedule(&scan_timeout_work, K_MSEC(500));
+	}
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected = connected,
+	.disconnected = disconnected,
+	.security_changed = security_changed,
+};
+
+/* ---------- 扫描超时/重启 ---------- */
+
+static void scan_timeout_handler(struct k_work *work)
+{
+	start_ble_scan();
+}
+
+/* 自动重连超时处理：如果在规定时间内未连接成功，停止自动重连并回退到普通扫描 */
+static void auto_connect_timeout_handler(struct k_work *work)
+{
+	LOG_INF("Auto connect timeout, stopping and falling back to BLE scan...");
+	bt_conn_create_auto_stop();
+	start_ble_scan();
+}
+
+/* 延迟自动重连处理：断连后等待 HCI 资源清理完毕，再启动硬件自动重连 */
+static void delayed_auto_connect_handler(struct k_work *work)
+{
+	LOG_INF("Auto connect starting now...");
+	int err = bt_conn_le_create_auto(BT_CONN_LE_CREATE_CONN_AUTO,
+					BT_LE_CONN_PARAM_DEFAULT);
+	if (err) {
+		LOG_ERR("Auto connect failed: %d, fallback to scan", err);
+		start_ble_scan();
+	} else {
+		/* 自动重连启动成功，设置 15 秒后备超时 */
+		k_work_schedule(&auto_connect_timeout_work, K_SECONDS(15));
+	}
+}
+
+/* ---------- BLE 扫描 ---------- */
+/*
+ * 注意：许多 BLE 鼠标在配对模式下不广播 HID Service UUID (0x1812)，
+ * 只广播设备名称和 Appearance(外观)。
+ * 因此我们不能只靠 UUID 过滤，也需要检查 Appearance。
+ */
+
+
+static bool eir_check_hid_mouse(struct bt_data *data, void *user_data)
+{
+	bt_addr_le_t *addr = user_data;
+	int i;
+
+	switch (data->type) {
+	case BT_DATA_UUID16_SOME:
+	case BT_DATA_UUID16_ALL:
+		/* 检查是否包含 HID Service UUID (0x1812) */
+		if (data->data_len % sizeof(uint16_t) != 0U) {
+			return true;
+		}
+		for (i = 0; i < data->data_len; i += sizeof(uint16_t)) {
+			uint16_t u16;
+			memcpy(&u16, &data->data[i], sizeof(u16));
+			if (sys_le16_to_cpu(u16) == BT_UUID_HIDS_VAL) {
+				LOG_INF("HID Service UUID found, connecting...");
+				goto do_connect;
+			}
+		}
+		break;
+
+	case BT_DATA_GAP_APPEARANCE:
+		/* 检查 Appearance 是否为鼠标 (0x03C2=962) */
+		if (data->data_len >= sizeof(uint16_t)) {
+			uint16_t appearance;
+			memcpy(&appearance, data->data, sizeof(uint16_t));
+			if (sys_le16_to_cpu(appearance) == BT_APPEARANCE_HID_MOUSE) {
+				LOG_INF("Mouse appearance found, connecting...");
+				goto do_connect;
+			}
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	return true;
+
+do_connect:
+	bt_le_scan_stop();
+
+	int err = bt_conn_le_create(addr,
+		BT_CONN_LE_CREATE_CONN,
+		BT_LE_CONN_PARAM_DEFAULT, &ble_conn);
+	if (err) {
+		LOG_ERR("Create conn failed: %d", err);
+		/* 3秒后重试扫描 */
+		k_work_schedule(&scan_timeout_work, K_SECONDS(3));
+	}
+	return false;
+}
+
+/* M720 的 MAC 前缀（BT 地址存储为小端序，val[0]=最低字节）
+ * MAC 字符串: FB:DE:BD:46:FF:0C
+ * val[]     : { 0x0C, 0xFF, 0x46, 0xBD, 0xDE, 0xFB }
+ * 前5字节前缀: FB:DE:BD:46:FF 对应 val[5..1]
+ */
+static const uint8_t target_mac_prefix[5] = { 0xFF, 0x46, 0xBD, 0xDE, 0xFB };
+
+static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
+			 struct net_buf_simple *ad)
+{
+	char dev[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(addr, dev, sizeof(dev));
+
+	/* 调试日志：打印所有扫描到的设备 */
+	LOG_INF("DEVICE: %s, RSSI %d, type %u", dev, rssi, type);
+
+	/* RSSI 过滤：信号不够强就不处理 */
+	if (rssi < BLE_HID_RSSI_THRESHOLD) {
+		LOG_DBG("RSSI too low: %d < %d", rssi, BLE_HID_RSSI_THRESHOLD);
+		return;
+	}
+
+	/* 只处理可连接广播 */
+	if (type != BT_GAP_ADV_TYPE_ADV_IND &&
+	    type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND &&
+	    type != BT_GAP_ADV_TYPE_EXT_ADV) {
+		LOG_DBG("Not connectable type: %u", type);
+		return;
+	}
+
+	/* 检查是否已经连接或正在连接 */
+	if (ble_conn != NULL) {
+		LOG_DBG("Already connected, skip");
+		return;
+	}
+
+	/* 已有绑定地址时：只精确匹配绑定的地址，防止连到其他设备槽。
+	 *
+	 * M720 有 3 个设备槽，每个槽有独立的随机地址和绑定信息。
+	 * 例如：设备槽2(FF:07)→电脑，设备槽3(FF:1D)→开发板。
+	 * 断开后如果扫描到设备2的广播（FF:07），MAC前缀也匹配，
+	 * 但连接过去会因密钥不匹配导致 0x3e。
+	 *
+	 * 精确匹配确保只连回之前绑定的那个设备槽。
+	 */
+	if (mouse_bond_addr_valid) {
+		/* 只连接已绑定的精确地址 */
+		if (bt_addr_le_cmp(addr, &mouse_bond_addr) == 0) {
+			LOG_INF("*** Bonded device found: %s! ***", dev);
+			bt_data_parse(ad, eir_check_hid_mouse, (void *)addr);
+		} else {
+			LOG_DBG("Not bonded address (%s), skip", dev);
+		}
+	} else {
+		/* 首次连接：使用 MAC 前缀匹配发现 M720 */
+		if (memcmp(&addr->a.val[1], target_mac_prefix, 5) == 0) {
+			LOG_INF("*** MAC prefix matched %s! Checking EIR data... ***", dev);
+			bt_data_parse(ad, eir_check_hid_mouse, (void *)addr);
+		} else {
+			LOG_DBG("MAC prefix mismatch");
+		}
+	}
+}
+
+static void start_ble_scan(void)
+{
+	int err;
+
+	/* 如果已连接，不扫描 */
+	if (ble_conn != NULL) {
+		return;
+	}
+
+	struct bt_le_scan_param scan_param = {
+		.type       = BT_LE_SCAN_TYPE_ACTIVE,
+		.options    = BT_LE_SCAN_OPT_NONE,
+		.interval   = BT_GAP_SCAN_FAST_INTERVAL,
+		.window     = BT_GAP_SCAN_FAST_WINDOW,
+	};
+
+	err = bt_le_scan_start(&scan_param, device_found);
+	if (err) {
+		LOG_ERR("BLE scan start failed: %d", err);
+		return;
+	}
+
+	LOG_INF("BLE scanning for HID mouse (RSSI >= %d dBm)...",
+		BLE_HID_RSSI_THRESHOLD);
+}
+
+/* ---------- USB 消息回调 ---------- */
+
+static void usbd_msg_cb(struct usbd_context *const usbd_ctx,
+			const struct usbd_msg *const msg)
+{
+	LOG_INF("USBD message: %s", usbd_msg_type_string(msg->type));
+
+	if (msg->type == USBD_MSG_CONFIGURATION) {
+		LOG_INF("\tConfiguration value %d", msg->status);
+	}
+
+	if (usbd_can_detect_vbus(usbd_ctx)) {
+		if (msg->type == USBD_MSG_VBUS_READY) {
+			int ret = usbd_enable(usbd_ctx);
+			if (ret) {
+				LOG_ERR("Failed to enable USB device support");
+			}
+		}
+
+		if (msg->type == USBD_MSG_VBUS_REMOVED) {
+			if (usbd_disable(usbd_ctx)) {
+				LOG_ERR("Failed to disable USB device support");
+			}
+		}
+	}
+}
 
 /* ============================================================
  *  主函数
@@ -206,28 +1135,100 @@ int main(void)
 		return ret;
 	}
 
-	/* ---- 第3步：初始化并启用 USB ---- */
-	sample_usbd = sample_usbd_init_device(NULL);
+	/* ---- 第3步：初始化 USB 设备栈（注册所有类、分配描述符等） ---- */
+	sample_usbd = sample_usbd_init_device(usbd_msg_cb);
 	if (sample_usbd == NULL) {
 		LOG_ERR("Failed to initialize USB device");
 		return -ENODEV;
 	}
 
-	usbd_enable(sample_usbd);
-	LOG_DBG("USB device support enabled");
+	/* ---- 第4步：启用 USB ---- */
+	if (!usbd_can_detect_vbus(sample_usbd)) {
+		ret = usbd_enable(sample_usbd);
+		if (ret) {
+			LOG_ERR("Failed to enable USB device support");
+			return ret;
+		}
+	}
+	/* 如果硬件支持 VBUS 检测，usbd_enable() 将在 VBUS 就绪后由回调调用 */
 
-	/* ---- 第4步：创建任务线程 ---- */
-	k_thread_create(&auto_mouse_thread, auto_mouse_stack,
-			K_THREAD_STACK_SIZEOF(auto_mouse_stack),
-			auto_mouse_task, NULL, NULL, NULL,
-			5, 0, K_NO_WAIT);
+	LOG_DBG("USB initialized");
 
+#if 0
+	/* ---- 第5步：创建键盘自动打字任务（调试用，暂时关闭） ---- */
 	k_thread_create(&auto_keyboard_thread, auto_keyboard_stack,
 			K_THREAD_STACK_SIZEOF(auto_keyboard_stack),
 			auto_keyboard_task, NULL, NULL, NULL,
 			5, 0, K_NO_WAIT);
+#endif
 
-	/* ---- 第5步：主循环，处理鼠标和键盘事件 ---- */
+	/* ---- 第6步：初始化工作队列 ---- */
+	k_work_init_delayable(&scan_timeout_work, scan_timeout_handler);
+	k_work_init_delayable(&conn_status_work, conn_status_handler);
+	k_work_init_delayable(&auto_connect_timeout_work, auto_connect_timeout_handler);
+	k_work_init_delayable(&delayed_auto_connect_work, delayed_auto_connect_handler);
+
+	/* ---- 第7步：初始化 BLE（失败不影响 USB HID 功能） ---- */
+	ret = bt_enable(NULL);
+	if (ret) {
+		LOG_ERR("BLE init failed: %d, USB HID will still work", ret);
+	} else {
+		LOG_INF("BLE initialized");
+
+		/* 加载持久化设置（备用） */
+		if (IS_ENABLED(CONFIG_SETTINGS)) {
+			settings_load();
+		}
+
+		/* 注册配对/认证回调 */
+		{
+			int cb_err = bt_conn_auth_cb_register(&auth_callbacks);
+			if (cb_err) {
+				LOG_ERR("Failed to register auth callbacks: %d", cb_err);
+			}
+		}
+		{
+			int cb_err = bt_conn_auth_info_cb_register(&auth_info_callbacks);
+			if (cb_err) {
+				LOG_ERR("Failed to register auth info callbacks: %d", cb_err);
+			}
+		}
+
+		LOG_INF("Pairing callbacks registered (NoInputNoOutput + Just Works). "
+			"Will try security L2, fallback to WWoR");
+
+		/* 从 Flash 恢复绑定设备到 Accept List（白名单）*/
+		mouse_bond_addr_valid = false;
+		bt_foreach_bond(BT_ID_DEFAULT, bond_restore_cb, NULL);
+
+		if (mouse_bond_addr_valid) {
+			/* 有绑定设备，启动硬件级自动重连（Accept List + Auto Connect）
+			 * BLE 控制器自动扫描定向广播（ADV_DIRECT_IND），
+			 * 发现鼠标后自动发起连接，不需要软件扫描
+			 *
+			 * 同时设置 3 秒超时：如果自动重连超时未连上，
+			 * 停止自动重连并回退到普通扫描模式。
+			 * Auto Connect 只对使用相同地址的定向广播有效，
+			 * M720 每次地址不同，大概率会超时回退到扫描。
+			 */
+			LOG_INF("Bonded mouse found, starting auto connect (3s timeout)...");
+			int err = bt_conn_le_create_auto(BT_CONN_LE_CREATE_CONN_AUTO,
+			 			BT_LE_CONN_PARAM_DEFAULT);
+			if (err) {
+			 LOG_ERR("Auto connect failed: %d, fallback to scan", err);
+			 start_ble_scan();
+			} else {
+			 /* 自动重连启动成功，设置 3 秒后备超时 */
+			 k_work_schedule(&auto_connect_timeout_work, K_SECONDS(3));
+			}
+		} else {
+			/* 没有绑定设备（第一次使用），启动普通 BLE 扫描 */
+			LOG_INF("No bonded device, starting BLE scan...");
+			start_ble_scan();
+		}
+	}
+
+	/* ---- 第8步：主循环，处理鼠标和键盘事件 ---- */
 	while (true) {
 		bool has_data = false;
 
@@ -240,6 +1241,8 @@ int main(void)
 				if (ret) {
 					LOG_ERR("Mouse report error, %d", ret);
 				}
+			} else {
+				LOG_DBG("Mouse USB not ready, drop report");
 			}
 			has_data = true;
 		}
@@ -253,6 +1256,8 @@ int main(void)
 				if (ret) {
 					LOG_ERR("KB report error, %d", ret);
 				}
+			} else {
+				LOG_DBG("KB USB not ready, drop report");
 			}
 			has_data = true;
 		}
