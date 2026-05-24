@@ -23,6 +23,7 @@
 
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_hid.h>
+#include <zephyr/drivers/uart.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -36,6 +37,26 @@
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+
+/* ============================================================
+ *  CDC ACM 虚拟 COM 端口
+ *  通过 USB 输出调试日志，不需要额外的串口线。
+ *  在电脑上用串口工具（如 PuTTY）连接出现的 COM 口即可看到日志。
+ *  注意：CDC ACM 不作为系统控制台初始化，仅通过 cdc_acm_print() 手动输出。
+ * ============================================================ */
+static const struct device *cdc_acm_dev;
+
+static void cdc_acm_print(const char *str)
+{
+	if (!cdc_acm_dev || !device_is_ready(cdc_acm_dev)) {
+		return;
+	}
+
+	while (*str) {
+		uart_poll_out(cdc_acm_dev, *str);
+		str++;
+	}
+}
 
 /* ============================================================
  *  RSSI 阈值：信号强度 >= 此值时尝试连接
@@ -151,14 +172,26 @@ static void ble_mouse_report_forward(const uint8_t *data, uint16_t len)
 		return;
 	}
 
-	/* 打印原始数据前 7 字节用于调试 */
-	LOG_INF("RAW[%u]: %02x %02x %02x %02x %02x %02x %02x",
-		len,
-		data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
+	/* 使用 LOG_HEXDUMP_INF 替代手动 snprintf 循环，
+	 * 避免在 BLE 回调栈上分配 256 字节缓冲区引发栈溢出。
+	 * LOG_HEXDUMP_INF 使用 logger 内部格式化，不占调用者栈空间。
+	 */
+	LOG_HEXDUMP_INF(data, MIN(len, 64), "BLE RAW");
+
+	/* ---- 打印按钮位（前 2 字节）---- */
+	if (len >= 1) {
+		LOG_INF("BTN: byte0=0x%02x byte1=0x%02x "
+			"L=%d R=%d M=%d B4=%d F5=%d",
+			data[0], (len > 1) ? data[1] : 0,
+			(data[0] >> 0) & 1,  /* Left   */
+			(data[0] >> 1) & 1,  /* Right  */
+			(data[0] >> 2) & 1,  /* Middle */
+			(data[0] >> 3) & 1,  /* Back   */
+			(data[0] >> 4) & 1); /* Forward */
+	}
 
 	/* 跳过 19 字节 Logitech HID++ 报告 (Report ID 0x11) */
 	if (len == 19) {
-		LOG_DBG("Skipping HID++ report (19 bytes)");
 		return;
 	}
 
@@ -167,10 +200,19 @@ static void ble_mouse_report_forward(const uint8_t *data, uint16_t len)
 		report[MOUSE_BTN_REPORT_IDX] = data[0];
 		report[MOUSE_X_REPORT_IDX] = data[1];
 		report[MOUSE_Y_REPORT_IDX] = data[2];
+		LOG_INF("Boot -> btn=0x%02x X=%d Y=%d",
+			data[0], (int8_t)data[1], (int8_t)data[2]);
 	} else {
-		/* 7 字节 Report ID 2 格式: 用 HID Report Map 定义的位布局解析 */
+		/* 7 字节 Report ID 2 格式 */
 		unpack_mouse_report_7byte(data, report);
 	}
+
+	/* 打印最终发送到 USB 的报告内容 */
+	LOG_INF("USB: [btn=0x%02x X=%d Y=%d wheel=%d]",
+		report[MOUSE_BTN_REPORT_IDX],
+		(int8_t)report[MOUSE_X_REPORT_IDX],
+		(int8_t)report[MOUSE_Y_REPORT_IDX],
+		(int8_t)report[MOUSE_WHEEL_REPORT_IDX]);
 
 	if (k_msgq_put(&mouse_msgq, report, K_NO_WAIT) != 0) {
 		LOG_DBG("Mouse msgq full, dropping report");
@@ -1644,8 +1686,17 @@ int main(void)
 
 	LOG_DBG("USB initialized");
 
+	/* ---- 第5步：初始化 CDC ACM 虚拟 COM 端口 ---- */
+	cdc_acm_dev = DEVICE_DT_GET(DT_NODELABEL(cdc_acm_uart0));
+	if (device_is_ready(cdc_acm_dev)) {
+		cdc_acm_print("CDC ACM virtual COM port ready\r\n");
+		LOG_INF("CDC ACM UART initialized");
+	} else {
+		LOG_DBG("CDC ACM UART not available");
+	}
+
 #if 0
-	/* ---- 第5步：创建键盘自动打字任务（调试用，暂时关闭） ---- */
+	/* ---- 第6步：创建键盘自动打字任务（调试用，暂时关闭） ---- */
 	k_thread_create(&auto_keyboard_thread, auto_keyboard_stack,
 			K_THREAD_STACK_SIZEOF(auto_keyboard_stack),
 			auto_keyboard_task, NULL, NULL, NULL,
@@ -1729,7 +1780,14 @@ int main(void)
 				ret = hid_device_submit_report(mouse_dev,
 					MOUSE_REPORT_COUNT, mouse_report);
 				if (ret) {
-					LOG_ERR("Mouse report error, %d", ret);
+					LOG_ERR("USB submit error: %d", ret);
+				} else {
+					LOG_DBG("USB report sent: "
+						"[0x%02x %d %d %d]",
+						mouse_report[MOUSE_BTN_REPORT_IDX],
+						(int8_t)mouse_report[MOUSE_X_REPORT_IDX],
+						(int8_t)mouse_report[MOUSE_Y_REPORT_IDX],
+						(int8_t)mouse_report[MOUSE_WHEEL_REPORT_IDX]);
 				}
 			} else {
 				LOG_DBG("Mouse USB not ready, drop report");
